@@ -1,0 +1,76 @@
+import type { ServeBuilder, HttpMethod, AuthContext } from "./types.js";
+
+/**
+ * Configuration for a single query's client-side behavior
+ */
+export interface QueryClientConfig {
+  method: HttpMethod;
+  path?: string;
+}
+
+/**
+ * Map of query names to their client configurations
+ */
+export type ApiClientConfig = Record<string, QueryClientConfig>;
+
+/**
+ * Extract serializable client configuration from a ServeBuilder.
+ * This generates a runtime object that can be used client-side to configure
+ * HTTP methods and paths for each query.
+ *
+ * Prioritizes route-level method configuration over endpoint defaults.
+ *
+ * @example
+ * // Server-side (e.g., in api/config/route.ts)
+ * import { api } from '@/analytics/queries';
+ * import { extractClientConfig } from '@hypequery/serve';
+ *
+ * export async function GET() {
+ *   return Response.json(extractClientConfig(api));
+ * }
+ *
+ * // Client-side
+ * const config = await fetch('/api/config').then(r => r.json());
+ * createHooks<Api>({ baseUrl: '/api/hypequery', config });
+ */
+export function extractClientConfig<
+  TQueries extends Record<string, any>,
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext
+>(api: ServeBuilder<TQueries, TContext, TAuth>): ApiClientConfig {
+  const config: ApiClientConfig = {};
+
+  // Prefer route-level config if available
+  if (api._routeConfig) {
+    for (const [key, routeConfig] of Object.entries(api._routeConfig)) {
+      config[key] = {
+        method: routeConfig.method,
+        path: api.queries[key as keyof typeof api.queries]?.metadata?.path,
+      };
+    }
+  } else {
+    // Fallback to endpoint method
+    for (const [key, endpoint] of Object.entries(api.queries)) {
+      config[key] = {
+        method: endpoint.method,
+        path: endpoint.metadata?.path,
+      };
+    }
+  }
+
+  return config;
+}
+
+/**
+ * Type-safe helper to manually define client configuration.
+ * Use this when you can't access the api object client-side.
+ *
+ * @example
+ * const config = defineClientConfig({
+ *   hello: { method: 'GET', path: '/api/analytics/queries/hello' },
+ *   createUser: { method: 'POST', path: '/api/analytics/queries/createUser' },
+ * });
+ */
+export function defineClientConfig<T extends ApiClientConfig>(config: T): T {
+  return config;
+}

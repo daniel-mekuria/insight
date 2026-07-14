@@ -1,0 +1,452 @@
+import { setupTestBuilder } from './test-utils.js';
+
+describe('QueryBuilder - Where Conditions', () => {
+  let builder: ReturnType<typeof setupTestBuilder>;
+
+  beforeEach(() => {
+    builder = setupTestBuilder();
+  });
+
+  describe('basic conditions', () => {
+    it('should handle all comparison operators', () => {
+      const operators = [
+        ['eq', '='],
+        ['neq', '!='],
+        ['gt', '>'],
+        ['gte', '>='],
+        ['lt', '<'],
+        ['lte', '<=']
+      ];
+
+      operators.forEach(([op, sql]) => {
+        const query = setupTestBuilder()
+          .where('price', op as any, 100)
+          .toSQL();
+        expect(query).toBe(`SELECT * FROM test_table WHERE price ${sql} 100`);
+      });
+    });
+
+    it('should handle special characters in LIKE', () => {
+      const sql = builder
+        .where('name', 'like', "%O'Brien%")
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE name LIKE '%O''Brien%'");
+    });
+
+    it('should support explicit null helpers', () => {
+      const sql = builder
+        .whereNull('optional_name')
+        .orWhereNotNull('name')
+        .toSQL();
+
+      expect(sql).toBe('SELECT * FROM test_table WHERE optional_name IS NULL OR name IS NOT NULL');
+    });
+
+    it('should support prewhere clauses', () => {
+      const sql = builder
+        .prewhere('active', 'eq', 1)
+        .orPrewhere('category', 'eq', 'premium')
+        .where('price', 'gt', 100)
+        .toSQL();
+
+      expect(sql).toBe("SELECT * FROM test_table PREWHERE active = 1 OR category = 'premium' WHERE price > 100");
+    });
+
+    it('should support prewhere null helpers', () => {
+      const sql = builder
+        .prewhereNull('optional_name')
+        .prewhereNotNull('name')
+        .toSQL();
+
+      expect(sql).toBe('SELECT * FROM test_table PREWHERE optional_name IS NULL AND name IS NOT NULL');
+    });
+  });
+
+  describe('orWhere conditions', () => {
+    it('should handle simple OR conditions', () => {
+      const sql = builder
+        .where('category', 'eq', 'electronics')
+        .orWhere('price', 'gt', 1000)
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE category = 'electronics' OR price > 1000");
+    });
+
+    it('should handle multiple OR conditions', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhere('category', 'eq', 'premium')
+        .orWhere('price', 'gte', 500)
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 OR category = 'premium' OR price >= 500");
+    });
+
+    it('should handle OR with different operators', () => {
+      const sql = builder
+        .where('name', 'like', '%test%')
+        .orWhere('price', 'between', [100, 200])
+        .orWhere('category', 'in', ['electronics', 'books'])
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE name LIKE '%test%' OR price BETWEEN 100 AND 200 OR category IN ('electronics', 'books')");
+    });
+  });
+
+  describe('whereGroup conditions', () => {
+    it('treats an empty whereGroup as a no-op', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .whereGroup(() => {})
+        .toSQL();
+
+      expect(sql).toBe('SELECT * FROM test_table WHERE active = 1');
+    });
+
+    it('should handle simple whereGroup', () => {
+      const sql = builder
+        .whereGroup((qb) => {
+          qb.where('price', 'gte', 100)
+            .orWhere('category', 'eq', 'premium');
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (price >= 100 OR category = 'premium')");
+    });
+
+    it('should handle whereGroup with external conditions', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .whereGroup((qb) => {
+          qb.where('price', 'gte', 100)
+            .orWhere('category', 'eq', 'premium');
+        })
+        .where('created_at', 'gte', '2024-01-01')
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 AND (price >= 100 OR category = 'premium') AND created_at >= '2024-01-01'");
+    });
+
+    it('should handle multiple whereGroup calls', () => {
+      const sql = builder
+        .whereGroup((qb) => {
+          qb.where('price', 'gte', 100)
+            .orWhere('category', 'eq', 'premium');
+        })
+        .whereGroup((qb) => {
+          qb.where('active', 'eq', 1)
+            .orWhere('created_by', 'eq', 1);
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (price >= 100 OR category = 'premium') AND (active = 1 OR created_by = 1)");
+    });
+  });
+
+  describe('orWhereGroup conditions', () => {
+    it('treats an empty orWhereGroup as a no-op', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhereGroup(() => {})
+        .toSQL();
+
+      expect(sql).toBe('SELECT * FROM test_table WHERE active = 1');
+    });
+
+    it('should handle simple orWhereGroup', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhereGroup((qb) => {
+          qb.where('price', 'gte', 1000)
+            .orWhere('category', 'eq', 'luxury');
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 OR (price >= 1000 OR category = 'luxury')");
+    });
+
+    it('should handle multiple orWhereGroup calls', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhereGroup((qb) => {
+          qb.where('price', 'gte', 1000)
+            .orWhere('category', 'eq', 'luxury');
+        })
+        .orWhereGroup((qb) => {
+          qb.where('created_by', 'eq', 1)
+            .orWhere('updated_by', 'eq', 1);
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 OR (price >= 1000 OR category = 'luxury') OR (created_by = 1 OR updated_by = 1)");
+    });
+  });
+
+  describe('nested group conditions', () => {
+    it('should handle nested whereGroup inside whereGroup', () => {
+      const sql = builder
+        .whereGroup((qb) => {
+          qb.where('active', 'eq', 1)
+            .whereGroup((innerQb) => {
+              innerQb.where('price', 'gte', 100)
+                .orWhere('category', 'eq', 'premium');
+            });
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (active = 1 AND (price >= 100 OR category = 'premium'))");
+    });
+
+    it('should handle orWhereGroup inside whereGroup', () => {
+      const sql = builder
+        .whereGroup((qb) => {
+          qb.where('status', 'eq', 'completed')
+            .orWhereGroup((innerQb) => {
+              innerQb.where('total', 'gte', 100)
+                .orWhere('priority', 'eq', 'high');
+            });
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (status = 'completed' OR (total >= 100 OR priority = 'high'))");
+    });
+
+    it('should handle whereGroup inside orWhereGroup', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhereGroup((qb) => {
+          qb.where('price', 'gte', 1000)
+            .whereGroup((innerQb) => {
+              innerQb.where('category', 'eq', 'luxury')
+                .orWhere('brand', 'eq', 'premium');
+            });
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 OR (price >= 1000 AND (category = 'luxury' OR brand = 'premium'))");
+    });
+
+    it('should handle deeply nested groups', () => {
+      const sql = builder
+        .whereGroup((qb) => {
+          qb.where('active', 'eq', 1)
+            .whereGroup((innerQb) => {
+              innerQb.where('price', 'gte', 100)
+                .orWhereGroup((deepQb) => {
+                  deepQb.where('category', 'eq', 'premium')
+                    .orWhere('brand', 'eq', 'luxury');
+                });
+            });
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (active = 1 AND (price >= 100 OR (category = 'premium' OR brand = 'luxury')))");
+    });
+
+    it('should preserve nested where/orWhere groups alongside prewhere clauses', () => {
+      const query = builder
+        .prewhere('active', 'eq', 1)
+        .orPrewhere('category', 'eq', 'premium')
+        .whereGroup((qb) => {
+          qb.where('status', 'eq', 'completed')
+            .orWhereGroup((innerQb) => {
+              innerQb.where('total', 'gte', 100)
+                .whereGroup((deepQb) => {
+                  deepQb.where('priority', 'eq', 'high')
+                    .orWhere('brand', 'eq', 'luxury');
+                });
+            });
+        })
+        .whereNotNull('optional_name');
+
+      expect(query.toSQL()).toBe(
+        "SELECT * FROM test_table PREWHERE active = 1 OR category = 'premium' WHERE (status = 'completed' OR (total >= 100 AND (priority = 'high' OR brand = 'luxury'))) AND optional_name IS NOT NULL"
+      );
+
+      const queryNode = query.toQueryNode();
+      expect(queryNode.kind).toBe('select-query');
+      expect(queryNode.prewhere?.kind).toBe('sequence');
+      expect(queryNode.where?.kind).toBe('sequence');
+    });
+  });
+
+  describe('complex mixed conditions', () => {
+    it('should handle complex mixed AND/OR conditions', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .whereGroup((qb) => {
+          qb.where('price', 'gte', 100)
+            .orWhere('category', 'eq', 'premium');
+        })
+        .orWhere('created_by', 'eq', 1)
+        .whereGroup((qb) => {
+          qb.where('updated_by', 'eq', 1)
+            .orWhere('category', 'eq', 'admin');
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 AND (price >= 100 OR category = 'premium') OR created_by = 1 AND (updated_by = 1 OR category = 'admin')");
+    });
+
+    it('should handle multiple conditions with groups', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhereGroup((qb) => {
+          qb.where('price', 'gte', 1000)
+            .orWhere('category', 'eq', 'luxury');
+        })
+        .where('created_at', 'gte', '2024-01-01')
+        .orWhereGroup((qb) => {
+          qb.where('updated_by', 'eq', 1)
+            .orWhere('created_by', 'eq', 1);
+        })
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE active = 1 OR (price >= 1000 OR category = 'luxury') AND created_at >= '2024-01-01' OR (updated_by = 1 OR created_by = 1)");
+    });
+  });
+
+  describe('edge cases', () => {
+    it('should handle boolean values', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .toSQL();
+      expect(sql).toBe('SELECT * FROM test_table WHERE active = 1');
+    });
+
+    it('should handle array with special characters in IN', () => {
+      const sql = builder
+        .where('name', 'in', ["O'Brien", "McDonald's"])
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE name IN ('O''Brien', 'McDonald''s')");
+    });
+
+    it('should handle empty arrays in IN', () => {
+      const sql = builder
+        .where('id', 'in', [])
+        .toSQL();
+      expect(sql).toBe('SELECT * FROM test_table WHERE 1 = 0');
+    });
+
+    it('should handle empty arrays in NOT IN as a match-all condition', () => {
+      const sql = builder
+        .where('id', 'notIn', [])
+        .toSQL();
+      expect(sql).toBe('SELECT * FROM test_table WHERE 1 = 1');
+    });
+
+    it('should handle empty whereGroup', () => {
+      const sql = builder
+        .whereGroup((_qb) => {
+          // Empty group
+        })
+        .toSQL();
+      expect(sql).toBe('SELECT * FROM test_table');
+    });
+
+    it('should handle single condition in whereGroup', () => {
+      const sql = builder
+        .whereGroup((qb) => {
+          qb.where('active', 'eq', 1);
+        })
+        .toSQL();
+      expect(sql).toBe('SELECT * FROM test_table WHERE (active = 1)');
+    });
+
+    it('should handle single condition in orWhereGroup', () => {
+      const sql = builder
+        .where('active', 'eq', 1)
+        .orWhereGroup((qb) => {
+          qb.where('price', 'gte', 1000);
+        })
+        .toSQL();
+      expect(sql).toBe('SELECT * FROM test_table WHERE active = 1 OR (price >= 1000)');
+    });
+  });
+
+  describe('function predicates', () => {
+    it('should support expression builder within where', () => {
+      const sql = builder
+        .where(expr => expr.fn('startsWith', 'name', expr.literal('foo')))
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE startsWith(name, 'foo')");
+    });
+
+    it('should support expression builder with OR logic', () => {
+      const sql = builder
+        .where(expr =>
+          expr.or([
+            expr.fn('hasAny', 'tags', ['foo']),
+            expr.raw("status = 'active'")
+          ])
+        )
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (hasAny(tags, ['foo'])) OR (status = 'active')");
+    });
+
+    it('should support orWhere with builder callback', () => {
+      const sql = builder
+        .where('status', 'eq', 'active')
+        .orWhere(expr => expr.fn('hasAny', 'tags', ['foo']))
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE status = 'active' OR hasAny(tags, ['foo'])");
+    });
+
+    it('should support nested function expressions with literals', () => {
+      const sql = builder
+        .where(expr =>
+          expr.fn(
+            'hasAny',
+            expr.fn('lowerUTF8', 'tags'),
+            ['foo', 'bar']
+          )
+        )
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE hasAny(lowerUTF8(tags), ['foo', 'bar'])");
+    });
+
+    it('should support ClickHouse helper functions via expr.ch', () => {
+      const sql = builder
+        .where(expr => expr.fn('notEmpty', expr.ch.dictGet('users_dict', 'name', expr.col('created_by'))))
+        .toSQL();
+
+      expect(sql).toBe("SELECT * FROM test_table WHERE notEmpty(dictGet('users_dict', 'name', created_by))");
+    });
+
+    it('should support logical combinations', () => {
+      const sql = builder
+        .where(expr =>
+          expr.and([
+            expr.fn('hasAny', 'tags', ['foo']),
+            expr.or([
+              expr.raw("status = 'active'"),
+              expr.raw('priority > 5')
+            ])
+          ])
+        )
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE (hasAny(tags, ['foo'])) AND ((status = 'active') OR (priority > 5))");
+    });
+
+    it('should support raw expressions as arguments', () => {
+      const sql = builder
+        .where(expr =>
+          expr.fn(
+            'hasAny',
+            expr.raw('lowerUTF8(tags)'),
+            expr.raw("['foo','bar']")
+          )
+        )
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE hasAny(lowerUTF8(tags), ['foo','bar'])");
+    });
+
+    it('should allow raw expressions directly', () => {
+      const sql = builder
+        .where(expr => expr.raw("hasAny(tags, ['foo','bar'])"))
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE hasAny(tags, ['foo','bar'])");
+    });
+
+    it('should support other ClickHouse boolean functions', () => {
+      const sql = builder
+        .where(expr =>
+          expr.and([
+            expr.or([
+              expr.fn('startsWith', 'name', expr.literal('foo')),
+              expr.fn('notEmpty', 'tags')
+            ]),
+            expr.fn('endsWith', 'status', expr.literal('ing'))
+          ])
+        )
+        .toSQL();
+      expect(sql).toBe("SELECT * FROM test_table WHERE ((startsWith(name, 'foo')) OR (notEmpty(tags))) AND (endsWith(status, 'ing'))");
+    });
+  });
+});

@@ -1,0 +1,219 @@
+import { rawAs } from '../utils/sql-expressions.js';
+import { setupTestBuilder } from './test-utils.js';
+
+describe('QueryBuilder - Aggregations', () => {
+  let builder: ReturnType<typeof setupTestBuilder>;
+
+  beforeEach(() => {
+    builder = setupTestBuilder();
+  });
+
+  it('should build query with SUM', () => {
+    const sql = builder
+      .sum('price')
+      .toSQL();
+    expect(sql).toBe('SELECT SUM(price) AS price_sum FROM test_table');
+  });
+
+  it('should build query with COUNT', () => {
+    const sql = builder
+      .count('id')
+      .toSQL();
+    expect(sql).toBe('SELECT COUNT(id) AS id_count FROM test_table');
+  });
+
+  it('should combine multiple aggregations', () => {
+    const sql = builder
+      .select(['name'])
+      .sum('price')
+      .count('id')
+      .toSQL();
+    expect(sql).toBe('SELECT name, SUM(price) AS price_sum, COUNT(id) AS id_count FROM test_table GROUP BY name');
+  });
+
+  it('should infer GROUP BY from aliased expressions when adding aggregations', () => {
+    const sql = builder
+      .select([rawAs('toDate(created_at)', 'day')])
+      .sum('price')
+      .toSQL();
+
+    expect(sql).toBe('SELECT toDate(created_at) AS day, SUM(price) AS price_sum FROM test_table GROUP BY day');
+  });
+
+  it('should not infer GROUP BY from aggregate aliases when chaining aggregations', () => {
+    const sql = builder
+      .sum('price', 'revenue')
+      .count('id', 'order_count')
+      .toSQL();
+
+    expect(sql).toBe('SELECT SUM(price) AS revenue, COUNT(id) AS order_count FROM test_table');
+  });
+
+  it('should not infer GROUP BY from raw aggregate selections when adding aggregations', () => {
+    const sql = builder
+      .select([rawAs('COUNT(*)', 'total_rows')])
+      .sum('price')
+      .toSQL();
+
+    expect(sql).toBe('SELECT COUNT(*) AS total_rows, SUM(price) AS price_sum FROM test_table');
+  });
+
+  it('should preserve an explicit GROUP BY when adding aggregations later', () => {
+    const sql = builder
+      .select(['name'])
+      .groupBy('name')
+      .sum('price')
+      .toSQL();
+
+    expect(sql).toBe('SELECT name, SUM(price) AS price_sum FROM test_table GROUP BY name');
+  });
+
+  describe('HAVING', () => {
+    it('should add HAVING clause', () => {
+      const sql = builder
+        .select(['name'])
+        .sum('price')
+        .groupBy('name')
+        .having('price_sum > 1000')
+        .toSQL();
+      expect(sql).toBe('SELECT name, SUM(price) AS price_sum FROM test_table GROUP BY name HAVING price_sum > 1000');
+    });
+
+    it('should combine multiple HAVING conditions', () => {
+      const sql = builder
+        .select(['name'])
+        .sum('price')
+        .count('id')
+        .groupBy('name')
+        .having('price_sum > 1000')
+        .having('id_count > 5')
+        .toSQL();
+      expect(sql).toBe('SELECT name, SUM(price) AS price_sum, COUNT(id) AS id_count FROM test_table GROUP BY name HAVING price_sum > 1000 AND id_count > 5');
+    });
+  });
+
+  it('should allow custom alias for SUM', () => {
+    const sql = builder
+      .sum('price', 'total_revenue')
+      .toSQL();
+    expect(sql).toBe('SELECT SUM(price) AS total_revenue FROM test_table');
+  });
+
+  it('should allow custom alias for COUNT', () => {
+    const sql = builder
+      .count('id', 'num_orders')
+      .toSQL();
+    expect(sql).toBe('SELECT COUNT(id) AS num_orders FROM test_table');
+  });
+
+  it('should build query with COUNT DISTINCT', () => {
+    const sql = builder
+      .countDistinct('name', 'unique_names')
+      .toSQL();
+    expect(sql).toBe('SELECT COUNT(DISTINCT name) AS unique_names FROM test_table');
+  });
+
+  it('should infer GROUP BY for COUNT DISTINCT from aliased expressions', () => {
+    const sql = builder
+      .select([rawAs('toDate(created_at)', 'day')])
+      .countDistinct('name', 'unique_names')
+      .toSQL();
+
+    expect(sql).toBe(
+      'SELECT toDate(created_at) AS day, COUNT(DISTINCT name) AS unique_names FROM test_table GROUP BY day'
+    );
+  });
+
+  it('should combine multiple aggregations with custom aliases', () => {
+    const sql = builder
+      .select(['category'])
+      .sum('price', 'revenue')
+      .count('id', 'order_count')
+      .avg('price', 'average_price')
+      .toSQL();
+    expect(sql).toBe(
+      'SELECT category, ' +
+      'SUM(price) AS revenue, ' +
+      'COUNT(id) AS order_count, ' +
+      'AVG(price) AS average_price ' +
+      'FROM test_table ' +
+      'GROUP BY category'
+    );
+  });
+
+  describe('analytical aggregations', () => {
+    it('should build query with argMax', () => {
+      const sql = builder
+        .argMax('price', 'created_at', 'latest_price')
+        .toSQL();
+      expect(sql).toBe('SELECT argMax(price, created_at) AS latest_price FROM test_table');
+    });
+
+    it('should build query with argMin and a default alias', () => {
+      const sql = builder
+        .argMin('price', 'created_at')
+        .toSQL();
+      expect(sql).toBe('SELECT argMin(price, created_at) AS price_argMin FROM test_table');
+    });
+
+    it('should build query with quantile', () => {
+      const sql = builder
+        .quantile('price', 0.95, 'p95_price')
+        .toSQL();
+      expect(sql).toBe('SELECT quantile(0.95)(price) AS p95_price FROM test_table');
+    });
+
+    it('should reject quantile levels outside [0, 1]', () => {
+      expect(() => builder.quantile('price', 1.5, 'bad')).toThrow('between 0 and 1');
+    });
+
+    it('should build query with stddev and variance', () => {
+      const sql = builder
+        .stddev('price', 'price_sd')
+        .variance('price', 'price_var')
+        .toSQL();
+      expect(sql).toBe('SELECT stddevSamp(price) AS price_sd, varSamp(price) AS price_var FROM test_table');
+    });
+
+    it('should infer GROUP BY from plain selections but never from analytical aggregates', () => {
+      const sql = builder
+        .select(['category'])
+        .argMax('price', 'created_at', 'latest_price')
+        .quantile('price', 0.5, 'median_price')
+        .toSQL();
+      expect(sql).toBe(
+        'SELECT category, ' +
+        'argMax(price, created_at) AS latest_price, ' +
+        'quantile(0.5)(price) AS median_price ' +
+        'FROM test_table ' +
+        'GROUP BY category'
+      );
+    });
+
+    it('should not infer GROUP BY from raw analytical aggregate selections', () => {
+      const sql = builder
+        .select([
+          'category',
+          rawAs('argMax(price, created_at)', 'latest_price'),
+          rawAs('quantile(0.5)(price)', 'median_price'),
+          rawAs('stddevSamp(price)', 'price_sd'),
+          rawAs('varSamp(price)', 'price_var'),
+        ])
+        .count('id', 'order_count')
+        .toSQL();
+
+      // Only the plain `category` column is a grouping key; the raw analytical
+      // aggregates must be recognized as aggregates, not group keys.
+      expect(sql).toBe(
+        'SELECT category, ' +
+        'argMax(price, created_at) AS latest_price, ' +
+        'quantile(0.5)(price) AS median_price, ' +
+        'stddevSamp(price) AS price_sd, ' +
+        'varSamp(price) AS price_var, ' +
+        'COUNT(id) AS order_count ' +
+        'FROM test_table ' +
+        'GROUP BY category'
+      );
+    });
+  });
+});

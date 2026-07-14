@@ -1,0 +1,113 @@
+import { QueryBuilder } from '../src/core/query-builder.js';
+import type { DatabaseAdapter } from '../src/core/adapters/database-adapter.js';
+import { ClickHouseDialect } from '../src/core/dialects/clickhouse-dialect.js';
+import type { BuilderState } from '../src/core/types/builder-state.js';
+import type { InferClickHouseType } from '../src/types/clickhouse-types.js';
+import type { TableColumn, TableRecord } from '../src/types/schema.js';
+import { buildRuntimeContext, resolveCacheConfig } from '../src/core/cache/runtime-context.js';
+import { substituteParameters } from '../src/core/utils.js';
+
+// Simple helper utilities for compile-time assertions
+// The compiler will emit errors if any of these constraints fail, giving us type regression coverage.
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type AppSchema = {
+  users: {
+    id: 'Int32';
+    name: 'String';
+    created_at: 'DateTime';
+    age: 'UInt32';
+  };
+  events: {
+    event_id: 'UUID';
+    user_id: 'Int32';
+    ts: 'DateTime64(3)';
+  };
+};
+
+type UsersRecord = TableRecord<AppSchema['users']>;
+type EventsRecord = TableRecord<AppSchema['events']>;
+
+// Validate column inference from ClickHouse primitives
+type _UsersIdIsNumber = Expect<Equal<UsersRecord['id'], number>>;
+type _UsersCreatedAtIsString = Expect<Equal<UsersRecord['created_at'], string>>;
+type _EventsTimestampIsString = Expect<Equal<EventsRecord['ts'], string>>;
+type _UInt64InfersToString = Expect<Equal<InferClickHouseType<'UInt64'>, string>>;
+type _Int128InfersToString = Expect<Equal<InferClickHouseType<'Int128'>, string>>;
+type _UInt32InfersToNumber = Expect<Equal<InferClickHouseType<'UInt32'>, number>>;
+type _NullableUInt64InfersToStringOrNull = Expect<Equal<InferClickHouseType<'Nullable(UInt64)'>, string | null>>;
+type _ArrayUInt64InfersToStringArray = Expect<Equal<InferClickHouseType<'Array(UInt64)'>, string[]>>;
+type _MapUInt64InfersToStringValues = Expect<Equal<InferClickHouseType<'Map(String, UInt64)'>, Record<string, string>>>;
+type _TupleInfersPositionally = Expect<
+  Equal<
+    InferClickHouseType<'Tuple(UInt32, LowCardinality(String), String, String, LowCardinality(String))'>,
+    [number, string, string, string, string]
+  >
+>;
+type _ArrayOfTupleInfersNestedTupleRows = Expect<
+  Equal<
+    InferClickHouseType<'Array(Tuple(UInt32, LowCardinality(String), String, String, LowCardinality(String)))'>,
+    Array<[number, string, string, string, string]>
+  >
+>;
+type _MapTupleValuesInferPositionally = Expect<
+  Equal<
+    InferClickHouseType<'Map(String, Tuple(UInt64, Nullable(String)))'>,
+    Record<string, [string, string | null]>
+  >
+>;
+
+// Validate TableColumn helper emits both qualified + bare column unions
+type ExpectedColumns =
+  | 'users.id' | 'users.name' | 'users.created_at' | 'users.age'
+  | 'events.event_id' | 'events.user_id' | 'events.ts'
+  | 'id' | 'name' | 'created_at' | 'age'
+  | 'event_id' | 'user_id' | 'ts';
+type _TableColumnShape = Expect<Equal<TableColumn<AppSchema>, ExpectedColumns>>;
+
+// Instantiate a QueryBuilder purely for type checking
+type UsersState = BuilderState<
+  AppSchema,
+  'users',
+  TableRecord<AppSchema['users']>,
+  'users'
+>;
+
+const runtime = buildRuntimeContext(resolveCacheConfig(undefined, 'type-tests'));
+const adapter: DatabaseAdapter = {
+  name: 'type-tests',
+  query: async () => {
+    throw new Error('Type test adapter should not execute.');
+  },
+  render: (sql, params = []) => substituteParameters(sql, params)
+};
+const dialect = new ClickHouseDialect();
+
+const qb = new QueryBuilder<AppSchema, UsersState>(
+  'users',
+  {
+    schema: {} as AppSchema,
+    tables: 'users',
+    output: {} as TableRecord<AppSchema['users']>,
+    baseTable: 'users',
+    base: {} as AppSchema['users'],
+    aliases: {},
+    scalars: {}
+  },
+  runtime,
+  adapter,
+  dialect
+);
+
+const selected = qb.select(['id', 'name']);
+type SelectedRow = Awaited<ReturnType<typeof selected['execute']>>[number];
+type _SelectedRowShape = Expect<Equal<SelectedRow, { id: number; name: string }>>;
+
+// Ensure numeric comparisons remain type-safe
+qb.where('age', 'gt', 18);
+// @ts-expect-error - LIKE should not accept numeric columns
+qb.where('age', 'like', 'abc');
+
+// Ensure joins accept qualified column references
+qb.innerJoin('events', 'id', 'events.user_id');

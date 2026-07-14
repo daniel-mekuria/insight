@@ -1,0 +1,42 @@
+# Dependencies
+node_modules
+.pnpm-store
+
+# Build outputs
+dist
+build
+tsconfig*.tsbuildinfo
+
+# IDE
+.idea
+.vscode
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+packages/clickhouse/.env.test
+
+# Testing
+coverage
+packages/clickhouse/ci-diagnostics/
+packages/clickhouse/ci-diagnostics.zip
+
+# Misc
+.DS_Store
+.hypequery/
+examples/basic-dashboard/src/generated/clickhouse-schema.ts
+.turbo
+.turbo-build
+
+# Local Netlify folder
+.netlify
+
+# Generated website artifacts
+website-next/.source/
+dist-file-index.txt

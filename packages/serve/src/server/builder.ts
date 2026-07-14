@@ -1,0 +1,143 @@
+import type {
+  AuthContext,
+  AuthStrategy,
+  HttpMethod,
+  RouteManifest,
+  ServeBuilder,
+  ServeEndpoint,
+  ServeEndpointMap,
+  ServeMiddleware,
+  ServeQueriesMap,
+  ServeHandler,
+  ExecuteQueryFunction,
+  RouteRegistrationOptions,
+  StartServerOptions,
+} from "../types.js";
+import type { ServeRouter } from "../router.js";
+import { ServeQueryLogger } from "../query-logger.js";
+import { mergeTags } from "../utils.js";
+import { applyBasePath, normalizeRoutePath } from "../router.js";
+import { mapEndpointToToolkit } from "./mapper.js";
+
+const loadNodeAdapter = async () => {
+  if (typeof require !== "undefined") {
+    return require("../adapters/node.js");
+  }
+  return import("../adapters/node.js");
+};
+
+export const createBuilderMethods = <
+  TQueries extends ServeQueriesMap<TContext, TAuth>,
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext,
+>(
+  queryEntries: ServeEndpointMap<TQueries, TContext, TAuth>,
+  queryLogger: ServeQueryLogger,
+  routeConfig: Record<string, { method: HttpMethod }>,
+  router: ServeRouter,
+  authStrategies: AuthStrategy<TAuth>[],
+  globalMiddlewares: ServeMiddleware<any, any, TContext, TAuth>[],
+  executeQuery: ExecuteQueryFunction<ServeEndpointMap<TQueries, TContext, TAuth>, TContext>,
+  handler: ServeHandler,
+  basePath: string,
+): ServeBuilder<ServeEndpointMap<TQueries, TContext, TAuth>, TContext, TAuth> => {
+  const builder: ServeBuilder<ServeEndpointMap<TQueries, TContext, TAuth>, TContext, TAuth> = {
+    queries: queryEntries,
+    basePath: basePath || undefined,
+    queryLogger,
+    _routeConfig: routeConfig,
+
+    manifest: (): RouteManifest => {
+      const manifest: RouteManifest = {};
+      for (const [key, endpoint] of Object.entries(queryEntries) as [
+        string,
+        ServeEndpoint<any, any, TContext, TAuth>,
+      ][]) {
+        manifest[key] = {
+          method: routeConfig[key]?.method ?? endpoint.method,
+          path: applyBasePath(basePath, endpoint.metadata.path),
+        };
+      }
+      return manifest;
+    },
+
+    route: (path: string, endpoint: ServeEndpoint<any, any, TContext, TAuth>, options: Partial<RouteRegistrationOptions<TContext, TAuth>> = {}) => {
+      if (!endpoint) {
+        throw new Error("Endpoint definition is required when registering a route");
+      }
+
+      const method = options?.method ?? endpoint.method;
+
+      // Find the query key for this endpoint
+      const queryKey = Object.entries(queryEntries).find(([_, e]) => e === endpoint)?.[0];
+      if (queryKey) {
+        routeConfig[queryKey] = { method };
+      }
+
+      const normalizedPath = normalizeRoutePath(path);
+      const fallbackRequiresAuth = endpoint.auth
+        ? true
+        : authStrategies.length > 0
+          ? true
+          : undefined;
+      const requiresAuth =
+        options?.requiresAuth ?? endpoint.metadata.requiresAuth ?? fallbackRequiresAuth;
+      const visibility = options?.visibility ?? endpoint.metadata.visibility ?? "public";
+
+      const metadata = {
+        ...endpoint.metadata,
+        path: normalizedPath,
+        method,
+        name: options?.name ?? endpoint.metadata.name ?? endpoint.key,
+        summary: options?.summary ?? endpoint.metadata.summary,
+        description: options?.description ?? endpoint.metadata.description,
+        tags: mergeTags(endpoint.metadata.tags, options?.tags),
+        requiresAuth,
+        visibility,
+      } satisfies ServeEndpoint["metadata"];
+
+      const middlewares = [...endpoint.middlewares, ...(options?.middlewares ?? [])];
+
+      const registeredEndpoint: ServeEndpoint<any, any, TContext, TAuth> = {
+        ...endpoint,
+        method,
+        metadata,
+        middlewares,
+      };
+
+      router.register(registeredEndpoint);
+      return builder;
+    },
+
+    use: (middleware: ServeMiddleware<any, any, TContext, TAuth>) => {
+      globalMiddlewares.push(middleware);
+      return builder;
+    },
+
+    useAuth: (strategy: AuthStrategy<TAuth>) => {
+      authStrategies.push(strategy);
+      router.markRoutesRequireAuth();
+      return builder;
+    },
+
+    execute: executeQuery,
+    client: executeQuery,
+    run: executeQuery,
+
+    describe: () => {
+      const description = {
+        basePath: basePath || undefined,
+        queries: router.list().map(mapEndpointToToolkit),
+      };
+      return description;
+    },
+
+    handler,
+    start: async (options: StartServerOptions = {}) => {
+      const { startNodeServer } = await loadNodeAdapter();
+      return startNodeServer(handler, options);
+    },
+  };
+
+  return builder;
+};
