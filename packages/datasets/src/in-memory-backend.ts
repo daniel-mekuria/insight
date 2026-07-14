@@ -1,0 +1,423 @@
+import type {
+  MetricFilter,
+  MetricOrderBy,
+} from './types.js';
+import type {
+  PlanNode,
+  SemanticAggregationPlan,
+  SemanticBackend,
+  SemanticBackendResult,
+  SemanticExpression,
+  SemanticGrainPlan,
+  SemanticJoinPlan,
+} from './semantic-plan.js';
+
+export type InMemoryTable = Array<Record<string, unknown>>;
+export type InMemoryTables = Record<string, InMemoryTable>;
+
+function valueForField(row: Record<string, unknown>, field: string): unknown {
+  return row[field];
+}
+
+function compareFilter(actual: unknown, filter: MetricFilter): boolean {
+  switch (filter.operator) {
+    case 'eq':
+      return actual === filter.value;
+    case 'neq':
+      return actual !== filter.value;
+    case 'gt':
+      return Number(actual) > Number(filter.value);
+    case 'gte':
+      return Number(actual) >= Number(filter.value);
+    case 'lt':
+      return Number(actual) < Number(filter.value);
+    case 'lte':
+      return Number(actual) <= Number(filter.value);
+    case 'in':
+      return Array.isArray(filter.value) && filter.value.includes(actual);
+    case 'notIn':
+      return Array.isArray(filter.value) && !filter.value.includes(actual);
+    case 'between':
+      return Array.isArray(filter.value)
+        && filter.value.length === 2
+        && Number(actual) >= Number(filter.value[0])
+        && Number(actual) <= Number(filter.value[1]);
+    case 'like':
+      return typeof actual === 'string'
+        && typeof filter.value === 'string'
+        && actual.includes(filter.value.replaceAll('%', ''));
+    default:
+      return false;
+  }
+}
+
+function applyFilters(rows: InMemoryTable, filters: MetricFilter[]): InMemoryTable {
+  return rows.filter((row) => filters.every((filter) => compareFilter(valueForField(row, filter.field), filter)));
+}
+
+function applyTenant(
+  rows: InMemoryTable,
+  tenant?: Extract<PlanNode, { kind: 'aggregate' }>['tenant'],
+): InMemoryTable {
+  if (!tenant) {
+    return rows;
+  }
+  if (tenant.operator === 'in') {
+    return rows.filter((row) => tenant.value.includes(String(row[tenant.field])));
+  }
+  return rows.filter((row) => row[tenant.field] === tenant.value);
+}
+
+/**
+ * Enriches base rows with columns from to-one joined targets, keyed by the
+ * qualified name `<relationship>.<column>`. Mirrors a query-time LEFT JOIN:
+ * base rows without a matching target keep the joined columns undefined.
+ */
+function applyJoins(
+  rows: InMemoryTable,
+  joins: SemanticJoinPlan[] | undefined,
+  tables: InMemoryTables,
+): InMemoryTable {
+  if (!joins || joins.length === 0) {
+    return rows;
+  }
+
+  const indexes = joins.map((join) => {
+    const targetRows = applyTenant(tables[join.source] ?? [], join.tenant);
+    const index = new Map<string, Record<string, unknown>>();
+    for (const row of targetRows) {
+      const key = String(row[join.to]);
+      // To-one: first matching target wins; a mis-declared to-many still won't fan out.
+      if (!index.has(key)) {
+        index.set(key, row);
+      }
+    }
+    return { join, index };
+  });
+
+  return rows.map((row) => {
+    const enriched: Record<string, unknown> = { ...row };
+    for (const { join, index } of indexes) {
+      const match = index.get(String(row[join.from]));
+      if (match) {
+        for (const [column, value] of Object.entries(match)) {
+          enriched[`${join.relationship}.${column}`] = value;
+        }
+      }
+    }
+    return enriched;
+  });
+}
+
+function periodForValue(value: unknown, grain: SemanticGrainPlan): string {
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+
+  if (grain.unit === 'year') {
+    return `${date.getUTCFullYear()}-01-01`;
+  }
+  if (grain.unit === 'quarter') {
+    const quarterStartMonth = Math.floor(date.getUTCMonth() / 3) * 3;
+    return new Date(Date.UTC(date.getUTCFullYear(), quarterStartMonth, 1)).toISOString().slice(0, 10);
+  }
+  if (grain.unit === 'month') {
+    return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1)).toISOString().slice(0, 10);
+  }
+  if (grain.unit === 'week') {
+    const day = date.getUTCDay();
+    const weekStart = grain.weekStart ?? 1;
+    const diff = (day - weekStart + 7) % 7;
+    const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - diff));
+    return start.toISOString().slice(0, 10);
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+function groupKey(row: Record<string, unknown>, plan: Extract<PlanNode, { kind: 'aggregate' }>): string {
+  const parts = plan.dimensions.map((dimension) => row[dimension.field]);
+  if (plan.grain) {
+    parts.unshift(periodForValue(row[plan.grain.field], plan.grain));
+  }
+  return JSON.stringify(parts);
+}
+
+/**
+ * Percentile by linear interpolation over sorted values. Approximate parity
+ * with ClickHouse's sampling-based `quantile`; exact only for clean inputs.
+ */
+function percentileOf(values: number[], level: number): number {
+  if (values.length === 0) {
+    // ClickHouse `quantile` over an empty set yields nan.
+    return Number.NaN;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const position = (sorted.length - 1) * level;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) {
+    return sorted[lower];
+  }
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+/**
+ * Sample variance. Fewer than two values yields NaN, as in ClickHouse:
+ * `varSamp`/`stddevSamp` divide by n - 1, so a single row gives nan.
+ */
+function sampleVarianceOf(values: number[]): number {
+  if (values.length < 2) {
+    return Number.NaN;
+  }
+  const mean = values.reduce((total, value) => total + value, 0) / values.length;
+  const squaredDeviations = values.reduce((total, value) => total + (value - mean) ** 2, 0);
+  return squaredDeviations / (values.length - 1);
+}
+
+/** Value of `field` on the row where `argField` is most extreme; empty → null. */
+function argExtremeOf(
+  rows: InMemoryTable,
+  field: string,
+  argField: string,
+  extreme: 'max' | 'min',
+): unknown {
+  let best: Record<string, unknown> | undefined;
+  for (const row of rows) {
+    // ClickHouse argMax/argMin skip rows where either the value being
+    // returned or the ordering value is NULL ("both `arg` and `val` behave
+    // as aggregate functions, they both skip NULL"). Verified against
+    // ClickHouse 25.1: argMax(amount, created_at) over
+    // [(NULL, '2024-01-05'), (10, '2024-01-01')] returns 10, not NULL.
+    if (row[argField] == null || row[field] == null) {
+      continue;
+    }
+    if (
+      best === undefined
+      || (extreme === 'max' ? (row[argField] as any) > (best[argField] as any) : (row[argField] as any) < (best[argField] as any))
+    ) {
+      best = row;
+    }
+  }
+  return best?.[field] ?? null;
+}
+
+function aggregateRows(rows: InMemoryTable, aggregation: SemanticAggregationPlan): unknown {
+  if (
+    (aggregation.aggregation === 'argMax' || aggregation.aggregation === 'argMin')
+    && aggregation.filters?.length
+  ) {
+    throw new Error(`Measure filters are not supported on ${aggregation.aggregation} aggregations.`);
+  }
+
+  const filteredRows = applyFilters(rows, aggregation.filters ?? []);
+  const values = filteredRows.map((row) => row[aggregation.field]);
+  const numericValues = () => values.filter((value) => value != null).map((value) => Number(value));
+
+  switch (aggregation.aggregation) {
+    case 'sum':
+      return values.reduce<number>((total, value) => total + Number(value ?? 0), 0);
+    case 'count':
+      return filteredRows.length;
+    case 'countDistinct':
+      return new Set(values).size;
+    case 'avg':
+      return values.length === 0
+        ? 0
+        : values.reduce<number>((total, value) => total + Number(value ?? 0), 0) / values.length;
+    case 'min':
+      return Math.min(...values.map((value) => Number(value)));
+    case 'max':
+      return Math.max(...values.map((value) => Number(value)));
+    case 'argMax':
+    case 'argMin': {
+      if (!aggregation.argField) {
+        throw new Error(`Aggregation "${aggregation.aggregation}" for "${aggregation.name}" requires an argField.`);
+      }
+      return argExtremeOf(
+        filteredRows,
+        aggregation.field,
+        aggregation.argField,
+        aggregation.aggregation === 'argMax' ? 'max' : 'min',
+      );
+    }
+    case 'percentile': {
+      if (aggregation.level == null) {
+        throw new Error(`Aggregation "percentile" for "${aggregation.name}" requires a level.`);
+      }
+      return percentileOf(numericValues(), aggregation.level);
+    }
+    case 'stddev':
+      return Math.sqrt(sampleVarianceOf(numericValues()));
+    case 'variance':
+      return sampleVarianceOf(numericValues());
+    default:
+      return 0;
+  }
+}
+
+function evaluateExpression(expression: SemanticExpression, row: Record<string, unknown>): unknown {
+  switch (expression.kind) {
+    case 'ref':
+      return row[expression.name];
+    case 'literal':
+      return expression.value;
+    case 'binary': {
+      const left = Number(evaluateExpression(expression.left, row));
+      const right = Number(evaluateExpression(expression.right, row));
+      if (expression.operator === 'add') return left + right;
+      if (expression.operator === 'subtract') return left - right;
+      if (expression.operator === 'multiply') return left * right;
+      return right === 0 ? null : left / right;
+    }
+    case 'function': {
+      const [first, second] = expression.args.map((arg) => evaluateExpression(arg, row));
+      if (expression.name === 'nullIfZero') return Number(first) === 0 ? null : first;
+      if (expression.name === 'coalesce') return first == null ? second : first;
+      if (expression.name === 'round') {
+        const decimals = Number(second ?? 0);
+        const factor = 10 ** decimals;
+        return Math.round(Number(first) * factor) / factor;
+      }
+      if (expression.name === 'floor') return Math.floor(Number(first));
+      return Math.ceil(Number(first));
+    }
+    default:
+      return undefined;
+  }
+}
+
+function compareRows(orderBy: MetricOrderBy[]) {
+  return (a: Record<string, unknown>, b: Record<string, unknown>) => {
+    for (const order of orderBy) {
+      const av = a[order.field] as any;
+      const bv = b[order.field] as any;
+      if (av === bv) continue;
+      const result = av > bv ? 1 : -1;
+      return order.direction === 'desc' ? -result : result;
+    }
+    return 0;
+  };
+}
+
+function applyOrderLimitOffset(rows: InMemoryTable, plan: Pick<PlanNode, 'orderBy' | 'limit' | 'offset'>): InMemoryTable {
+  let result = [...rows];
+  if (plan.orderBy?.length) {
+    result = result.sort(compareRows(plan.orderBy));
+  }
+  if (plan.offset != null) {
+    result = result.slice(plan.offset);
+  }
+  if (plan.limit != null) {
+    result = result.slice(0, plan.limit);
+  }
+  return result;
+}
+
+/**
+ * The measure/metric columns a plan emits. These carry aggregate values, which
+ * ClickHouse serializes as strings over JSON (UInt64, Decimal, ...); the row
+ * types in `types.ts` reflect that. We compute and order them numerically (as
+ * ClickHouse does in SQL) and only stringify at the output boundary, so this
+ * backend stays a faithful double of the real one.
+ */
+function measureColumns(plan: PlanNode): string[] {
+  return plan.kind === 'aggregate'
+    ? plan.aggregations.map((aggregation) => aggregation.name)
+    : plan.metrics.map((metric) => metric.name);
+}
+
+function serializeMeasures(rows: InMemoryTable, measures: string[]): InMemoryTable {
+  return rows.map((row) => {
+    const next = { ...row };
+    for (const name of measures) {
+      if (typeof next[name] === 'number' && !Number.isFinite(next[name])) {
+        // ClickHouse JSON output serializes nan/inf as null
+        // (output_format_json_quote_denormals defaults to 0).
+        next[name] = null;
+      } else if (next[name] != null) {
+        next[name] = String(next[name]);
+      }
+    }
+    return next;
+  });
+}
+
+/**
+ * @deprecated The plan/backend execution path is frozen (bug fixes only); this
+ * backend remains as the test harness for that path. New code should use
+ * `createDatasetClient({ queryBuilder })`.
+ */
+export function createInMemoryBackend(tables: InMemoryTables): SemanticBackend {
+  function executeAggregate(plan: Extract<PlanNode, { kind: 'aggregate' }>): InMemoryTable {
+    const table = tables[plan.source] ?? [];
+    const joinedRows = applyJoins(table, plan.joins, tables);
+    const filteredRows = applyFilters(applyTenant(joinedRows, plan.tenant), plan.filters);
+    const groups = new Map<string, InMemoryTable>();
+
+    for (const row of filteredRows) {
+      const key = groupKey(row, plan);
+      groups.set(key, [...(groups.get(key) ?? []), row]);
+    }
+
+    if (groups.size === 0 && plan.dimensions.length === 0 && !plan.grain) {
+      groups.set('[]', []);
+    }
+
+    const output = Array.from(groups.values()).map((rows) => {
+      const first = rows[0] ?? {};
+      const record: Record<string, unknown> = {};
+
+      if (plan.grain) {
+        record[plan.grain.output] = periodForValue(first[plan.grain.field], plan.grain);
+      }
+      for (const dimension of plan.dimensions) {
+        record[dimension.name] = first[dimension.field];
+      }
+      for (const aggregation of plan.aggregations) {
+        record[aggregation.name] = aggregateRows(rows, aggregation);
+      }
+      return record;
+    });
+
+    return applyOrderLimitOffset(output, plan);
+  }
+
+  // Keeps measure values numeric so computation and ordering match ClickHouse's
+  // SQL semantics; the public `execute` stringifies them at the output boundary.
+  function executeNode(plan: PlanNode): InMemoryTable {
+    if (plan.kind === 'aggregate') {
+      return executeAggregate(plan);
+    }
+
+    const input = executeNode(plan.input);
+    const data = input.map((row) => {
+      const next: Record<string, unknown> = {};
+      if (plan.input.kind === 'aggregate') {
+        if (plan.input.grain) {
+          next[plan.input.grain.output] = row[plan.input.grain.output];
+        }
+        for (const dimension of plan.input.dimensions) {
+          next[dimension.name] = row[dimension.name];
+        }
+      }
+      for (const metric of plan.metrics) {
+        next[metric.name] = evaluateExpression(metric.expression, row);
+      }
+      return next;
+    });
+    return applyOrderLimitOffset(data, plan);
+  }
+
+  async function execute<T = Record<string, unknown>>(plan: PlanNode): Promise<SemanticBackendResult<T>> {
+    const start = Date.now();
+    const data = serializeMeasures(executeNode(plan), measureColumns(plan));
+
+    return {
+      data: data as T[],
+      meta: { timingMs: Date.now() - start },
+    };
+  }
+
+  return { execute };
+}

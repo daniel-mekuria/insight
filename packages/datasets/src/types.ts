@@ -1,0 +1,546 @@
+import type { QueryBuilderFactoryInput } from './query-builder-protocol.js';
+import type { SemanticCacheMetaInfo, SemanticCacheRuntime } from './cache/semantic-query-cache.js';
+import type { SemanticExpression } from './semantic-plan.js';
+
+export type FieldType = 'string' | 'number' | 'boolean' | 'timestamp';
+export type DimensionType = FieldType;
+
+export interface DimensionOptions {
+  label?: string;
+  description?: string;
+  column?: string;
+  sql?: string;
+  filterable?: boolean;
+  groupable?: boolean;
+}
+
+export interface DimensionDefinition<TType extends DimensionType = DimensionType> {
+  __type: 'field_definition';
+  fieldType: TType;
+  label?: string;
+  description?: string;
+  column?: string;
+  sql?: string;
+  filterable?: boolean;
+  groupable?: boolean;
+}
+
+export type InferDimensionType<T extends DimensionDefinition> =
+  T['fieldType'] extends 'string' ? string :
+  T['fieldType'] extends 'number' ? number :
+  T['fieldType'] extends 'boolean' ? boolean :
+  T['fieldType'] extends 'timestamp' ? string :
+  never;
+
+export type RelationshipKind = 'belongsTo' | 'hasMany' | 'hasOne';
+
+export interface RelationshipDefinition<
+  TTarget extends { __type: 'dataset'; name: string } = { __type: 'dataset'; name: string },
+  TKind extends RelationshipKind = RelationshipKind,
+> {
+  __type: 'relationship';
+  kind: TKind;
+  target: () => TTarget;
+  from: string;
+  to: string;
+}
+
+export type AggregationType =
+  | 'sum'
+  | 'count'
+  | 'countDistinct'
+  | 'avg'
+  | 'min'
+  | 'max'
+  | 'argMax'
+  | 'argMin'
+  | 'percentile'
+  | 'stddev'
+  | 'variance';
+export type MeasureAggregation = AggregationType;
+
+export interface AggregationSpec {
+  __type: 'aggregation_spec';
+  aggregation: AggregationType;
+  field: string;
+  /** Second column for argMax/argMin: the field whose extreme selects the row. */
+  argField?: string;
+  /** Percentile level in [0, 1]. Required when aggregation is 'percentile'. */
+  level?: number;
+  sql?: string;
+  filters?: MetricFilter[];
+}
+
+export interface MeasureOptions {
+  sql?: string;
+  label?: string;
+  description?: string;
+  filters?: MetricFilter[];
+}
+
+export interface MeasureDefinition {
+  __type: 'measure_definition';
+  aggregation: MeasureAggregation;
+  field: string;
+  /** Second column for argMax/argMin: the field whose extreme selects the row. */
+  argField?: string;
+  /** Percentile level in [0, 1]. Required when aggregation is 'percentile'. */
+  level?: number;
+  sql?: string;
+  label?: string;
+  description?: string;
+  filters?: MetricFilter[];
+}
+
+export type FormulaExpr = {
+  __type: 'formula_expr';
+  expression: SemanticExpression;
+  toSQL: () => string;
+};
+
+export interface DerivedMetricSpec<TDatasetName extends string = string> {
+  __type: 'derived_metric_spec';
+  uses: Record<string, BaseMetricRef<TDatasetName>>;
+  formula: (inputs: Record<string, string>) => FormulaExpr;
+}
+
+/**
+ * The wide dataset instance used as the default `TDataset` for a metric ref.
+ * Refs created via `DatasetInstance.metric()` carry their dataset's concrete
+ * dimension/measure types instead, enabling field-level typing downstream.
+ */
+export type DefaultMetricDataset<TDatasetName extends string = string> =
+  DatasetInstance<
+    Record<string, DimensionDefinition>,
+    Record<string, MeasureDefinition>,
+    Record<string, RelationshipDefinition>,
+    TDatasetName
+  >;
+
+export interface MetricRef<
+  TDatasetName extends string = string,
+  TMetricName extends string = string,
+  TSpec extends AggregationSpec | DerivedMetricSpec<TDatasetName> = AggregationSpec | DerivedMetricSpec<TDatasetName>,
+  TDataset extends DatasetInstance<any, any, any, TDatasetName> = DefaultMetricDataset<TDatasetName>,
+> {
+  __type: 'metric_ref';
+  datasetName: TDatasetName;
+  name: TMetricName;
+  spec: TSpec;
+  label?: string;
+  description?: string;
+  dataset: TDataset;
+  by(grain: TimeGrain): GrainedMetricRef<TDatasetName, TMetricName, TSpec, TDataset>;
+  contract(): MetricContract;
+}
+
+export type BaseMetricRef<
+  TDatasetName extends string = string,
+  TMetricName extends string = string,
+  TDataset extends DatasetInstance<any, any, any, TDatasetName> = DefaultMetricDataset<TDatasetName>,
+> = MetricRef<TDatasetName, TMetricName, AggregationSpec, TDataset>;
+
+export type DerivedMetricRef<
+  TDatasetName extends string = string,
+  TMetricName extends string = string,
+  TDataset extends DatasetInstance<any, any, any, TDatasetName> = DefaultMetricDataset<TDatasetName>,
+> = MetricRef<TDatasetName, TMetricName, DerivedMetricSpec<TDatasetName>, TDataset>;
+
+export interface GrainedMetricRef<
+  TDatasetName extends string = string,
+  TMetricName extends string = string,
+  TSpec extends AggregationSpec | DerivedMetricSpec<TDatasetName> = AggregationSpec | DerivedMetricSpec<TDatasetName>,
+  TDataset extends DatasetInstance<any, any, any, TDatasetName> = DefaultMetricDataset<TDatasetName>,
+> {
+  __type: 'grained_metric_ref';
+  metric: MetricRef<TDatasetName, TMetricName, TSpec, TDataset>;
+  grain: TimeGrain;
+  contract(): MetricContract;
+}
+
+export type MetricHandle<
+  TDatasetName extends string = string,
+  TMetricName extends string = string,
+  TSpec extends AggregationSpec | DerivedMetricSpec<TDatasetName> = AggregationSpec | DerivedMetricSpec<TDatasetName>,
+  TDataset extends DatasetInstance<any, any, any, TDatasetName> = DefaultMetricDataset<TDatasetName>,
+> = MetricRef<TDatasetName, TMetricName, TSpec, TDataset> | GrainedMetricRef<TDatasetName, TMetricName, TSpec, TDataset>;
+
+export type TimeGrain = 'day' | 'week' | 'month' | 'quarter' | 'year';
+
+export interface MetricContract {
+  kind: 'metric' | 'derived_metric' | 'grained_metric';
+  name: string;
+  dataset: string;
+  valueType: 'number';
+  label?: string;
+  description?: string;
+  dimensions: string[];
+  measures?: string[];
+  filters: string[];
+  grains: TimeGrain[];
+  grain?: TimeGrain;
+  requires?: string[];
+  tenantScoped: boolean;
+}
+
+export interface MetricFilter<
+  TField extends string = string,
+  TValue = unknown,
+> {
+  field: TField;
+  operator: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'in' | 'notIn' | 'between' | 'like';
+  value: TValue;
+}
+
+export interface MetricOrderBy<TField extends string = string> {
+  field: TField;
+  direction: 'asc' | 'desc';
+}
+
+export interface MetricQuery {
+  dimensions?: string[];
+  filters?: MetricFilter[];
+  orderBy?: MetricOrderBy[];
+  limit?: number;
+  offset?: number;
+  by?: TimeGrain;
+}
+
+export interface DatasetQuery {
+  dimensions?: string[];
+  measures?: string[];
+  filters?: MetricFilter[];
+  orderBy?: MetricOrderBy[];
+  limit?: number;
+  offset?: number;
+  by?: TimeGrain;
+}
+
+export interface MetricResultMeta {
+  timingMs?: number;
+  sql?: string;
+  tenant?: string;
+  /** Number of rows returned in `data`. */
+  rowCount?: number;
+  /**
+   * Offset pagination state. Present when the query specified a `limit`.
+   * `hasMore` is derived by over-fetching one row, so it is exact without a
+   * separate count query.
+   */
+  pagination?: {
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+  };
+  /** Result-cache observability. Present when the call went through the cache. */
+  cache?: SemanticCacheMetaInfo;
+}
+
+export interface MetricResult<T = Record<string, unknown>> {
+  data: T[];
+  meta?: MetricResultMeta;
+}
+
+export interface DatasetQueryResult<T = Record<string, unknown>> {
+  data: T[];
+  meta?: MetricResultMeta;
+}
+
+export type SemanticTenantRuntime =
+  | string
+  | { id: string }
+  | { in: string[] }
+  | { scope: 'all' };
+
+export interface SemanticExecutionRuntime {
+  builderFactory?: QueryBuilderFactoryInput;
+  tenant?: SemanticTenantRuntime;
+}
+
+export interface ExecutionContext {
+  runtime?: SemanticExecutionRuntime;
+  /**
+   * Per-call result-cache controls. `false` bypasses the cache entirely;
+   * `{ ttlMs }` opts this call into caching (or overrides the client default).
+   */
+  cache?: SemanticCacheRuntime | false;
+}
+
+export interface SemanticFilterDefinition {
+  __type: 'filter_definition';
+  field: string;
+  label?: string;
+  description?: string;
+  operators?: MetricFilter['operator'][];
+}
+
+export type SemanticFiltersDefinition = Record<string, SemanticFilterDefinition>;
+
+export interface DatasetLimits {
+  maxDimensions?: number;
+  maxMeasures?: number;
+  maxFilters?: number;
+  maxResultSize?: number;
+}
+
+export interface BaseMetricConfig<
+  TMeasures extends Record<string, MeasureDefinition> = Record<string, MeasureDefinition>,
+> {
+  measure: keyof TMeasures & string;
+  label?: string;
+  description?: string;
+}
+
+export interface DerivedMetricConfig<TDatasetName extends string = string> {
+  uses: Record<string, BaseMetricRef<TDatasetName>>;
+  formula: (inputs: Record<string, string>) => FormulaExpr;
+  label?: string;
+  description?: string;
+}
+
+export interface DatasetConfig<
+  TDimensions extends Record<string, DimensionDefinition> = Record<string, DimensionDefinition>,
+  TMeasures extends Record<string, MeasureDefinition> = Record<string, MeasureDefinition>,
+  TRelationships extends Record<string, RelationshipDefinition> = Record<string, never>,
+> {
+  source: string;
+  tenantKey?: string;
+  timeKey?: string;
+  dimensions: TDimensions;
+  measures?: TMeasures;
+  filters?: SemanticFiltersDefinition;
+  relationships?: TRelationships;
+  limits?: DatasetLimits;
+}
+
+export interface DatasetInstance<
+  TDimensions extends Record<string, DimensionDefinition> = Record<string, DimensionDefinition>,
+  TMeasures extends Record<string, MeasureDefinition> = Record<string, MeasureDefinition>,
+  TRelationships extends Record<string, RelationshipDefinition> = Record<string, never>,
+  TDatasetName extends string = string,
+> {
+  __type: 'dataset';
+  name: TDatasetName;
+  source: string;
+  tenantKey?: string;
+  timeKey?: string;
+  dimensions: TDimensions;
+  measures: TMeasures;
+  filters: SemanticFiltersDefinition;
+  relationships: TRelationships;
+  limits?: DatasetLimits;
+  metric<TName extends string>(
+    metricName: TName,
+    metricConfig: BaseMetricConfig<TMeasures>,
+  ): BaseMetricRef<TDatasetName, TName, DatasetInstance<TDimensions, TMeasures, TRelationships, TDatasetName>>;
+  metric<TName extends string>(
+    metricName: TName,
+    metricConfig: DerivedMetricConfig<TDatasetName>,
+  ): DerivedMetricRef<TDatasetName, TName, DatasetInstance<TDimensions, TMeasures, TRelationships, TDatasetName>>;
+}
+
+export interface DatasetRegistryInstance {
+  register(ds: DatasetInstance): void;
+  get(name: string): DatasetInstance | undefined;
+  getAll(): DatasetInstance[];
+  has(name: string): boolean;
+}
+
+export type AnyDatasetInstance = DatasetInstance<
+  Record<string, DimensionDefinition>,
+  Record<string, MeasureDefinition>,
+  Record<string, RelationshipDefinition>,
+  string
+>;
+
+type NonNeverStringKeys<T extends Record<string, unknown>> = {
+  [K in keyof T]: [T[K]] extends [never] ? never : K;
+}[keyof T] & string;
+
+export type KnownStringKeys<T> = {
+  [K in keyof T]: string extends K ? never : K extends string ? K : never;
+}[keyof T];
+
+type KnownStringKeysOrFallback<T extends Record<string, unknown>> =
+  [KnownStringKeys<T>] extends [never]
+    ? NonNeverStringKeys<T>
+    : KnownStringKeys<T> & NonNeverStringKeys<T>;
+
+type NonSqlDimensionNames<TDimensions extends Record<string, DimensionDefinition>> = {
+  [TName in KnownStringKeysOrFallback<TDimensions>]:
+    TDimensions[TName] extends { sql: string } ? never : TName;
+}[KnownStringKeysOrFallback<TDimensions>];
+
+type QueryableRelationshipDimensionNames<
+  TRelationships extends Record<string, RelationshipDefinition>,
+> = {
+  [TRelationshipName in KnownStringKeys<TRelationships>]:
+    TRelationships[TRelationshipName] extends RelationshipDefinition<
+      infer TTarget,
+      infer TKind
+    >
+      ? TKind extends 'hasMany'
+        ? never
+        : TTarget extends DatasetInstance<infer TDimensions, any, any, any>
+          ? `${TRelationshipName}.${NonSqlDimensionNames<TDimensions>}`
+          : never
+      : never;
+}[KnownStringKeys<TRelationships>];
+
+type DatasetDimensionDefinitionByName<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TName extends string,
+> = TName extends keyof TDataset['dimensions']
+  ? TDataset['dimensions'][TName]
+  : TName extends `${infer TRelationshipName}.${infer TDimensionName}`
+    ? TRelationshipName extends keyof TDataset['relationships']
+      ? TDataset['relationships'][TRelationshipName] extends RelationshipDefinition<
+          infer TTarget,
+          infer TKind
+        >
+        ? TKind extends 'hasMany'
+          ? never
+          : TTarget extends DatasetInstance<infer TDimensions, any, any, any>
+            ? TDimensionName extends keyof TDimensions
+              ? TDimensions[TDimensionName]
+              : never
+            : never
+        : never
+      : never
+    : never;
+
+// ---------------------------------------------------------------------------
+// Typed query / result helpers for client codegen and React hooks
+//
+// These constrain a query's dimension/measure/orderBy fields to the names a
+// dataset or metric actually declares, and describe a best-effort typed result
+// row. Filter fields stay `string` because a dataset's `filters` map is widened
+// to `SemanticFiltersDefinition` and does not preserve literal keys.
+//
+// Measure and metric values are `string`, not `number`: ClickHouse serializes
+// aggregate results (UInt64, Decimal, ...) as strings over JSON, and the query
+// builder's AggregationType makes the same choice.
+// ---------------------------------------------------------------------------
+
+/** Dimension names declared by a dataset. */
+export type DatasetDimensionNames<TDataset extends DatasetInstance<any, any, any, any>> =
+  | KnownStringKeysOrFallback<TDataset['dimensions']>
+  | QueryableRelationshipDimensionNames<TDataset['relationships']>;
+
+/** Dimension definitions addressable by a one-hop dataset query. */
+export type DatasetQueryableDimensions<TDataset extends DatasetInstance<any, any, any, any>> = {
+  [TName in DatasetDimensionNames<TDataset>]: DatasetDimensionDefinitionByName<TDataset, TName>;
+};
+
+/** Backwards-compatible alias for all queryable dataset dimension names. */
+export type DatasetFieldNames<TDataset extends DatasetInstance<any, any, any, any>> =
+  DatasetDimensionNames<TDataset>;
+
+/** Measure names declared by a dataset. */
+export type DatasetMeasureNames<TDataset extends DatasetInstance<any, any, any, any>> =
+  KnownStringKeysOrFallback<TDataset['measures']>;
+
+/**
+ * Fields a result can be ordered by. This is the selection-independent superset
+ * (every dimension + measure, plus the synthetic `period` column for grained
+ * queries); the runtime validator additionally requires the field to be selected.
+ */
+export type DatasetOrderableNames<TDataset extends DatasetInstance<any, any, any, any>> =
+  | DatasetDimensionNames<TDataset>
+  | DatasetMeasureNames<TDataset>
+  | 'period';
+
+/** A dataset query whose fields are constrained to the dataset's contract. */
+export interface DatasetQueryFor<TDataset extends DatasetInstance<any, any, any, any>> {
+  dimensions?: readonly DatasetDimensionNames<TDataset>[];
+  measures?: readonly DatasetMeasureNames<TDataset>[];
+  filters?: readonly MetricFilter[];
+  orderBy?: readonly MetricOrderBy<DatasetOrderableNames<TDataset>>[];
+  limit?: number;
+  offset?: number;
+  by?: TimeGrain;
+  includeMeta?: boolean;
+}
+
+type SelectedDimensions<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TQuery,
+> = TQuery extends { dimensions: readonly (infer TName)[] }
+  ? Extract<TName, DatasetDimensionNames<TDataset>>
+  : never;
+
+type SelectedDatasetMeasures<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TQuery,
+> = TQuery extends { measures: readonly (infer TName)[] }
+  ? Extract<TName, DatasetMeasureNames<TDataset>>
+  : DatasetMeasureNames<TDataset>;
+
+type PeriodSelection<TQuery> = TQuery extends { by: TimeGrain }
+  ? { period?: string }
+  : {};
+
+/** A broad typed result row for a dataset, independent of projection. */
+export type DatasetRow<TDataset extends DatasetInstance<any, any, any, any>> =
+  & { [K in DatasetDimensionNames<TDataset>]?: InferDimensionType<DatasetQueryableDimensions<TDataset>[K]> }
+  & { [K in DatasetMeasureNames<TDataset>]?: string }
+  & { period?: string };
+
+/** A projection-aware typed result row for a dataset query. */
+export type DatasetRowFor<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TQuery = DatasetQueryFor<TDataset>,
+> =
+  & { [K in SelectedDimensions<TDataset, TQuery>]?: InferDimensionType<DatasetQueryableDimensions<TDataset>[K]> }
+  & { [K in SelectedDatasetMeasures<TDataset, TQuery>]?: string }
+  & PeriodSelection<TQuery>;
+
+export interface DatasetQueryResultFor<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TQuery = DatasetQueryFor<TDataset>,
+> {
+  data: DatasetRowFor<TDataset, TQuery>[];
+  meta?: MetricResultMeta;
+}
+
+/** A metric query whose fields are constrained to the metric's dataset + value column. */
+export interface MetricQueryFor<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TMetricName extends string,
+> {
+  dimensions?: readonly DatasetDimensionNames<TDataset>[];
+  filters?: readonly MetricFilter[];
+  orderBy?: readonly MetricOrderBy<DatasetDimensionNames<TDataset> | TMetricName | 'period'>[];
+  limit?: number;
+  offset?: number;
+  by?: TimeGrain;
+  includeMeta?: boolean;
+}
+
+/** A best-effort typed result row for a metric query (dimensions + the metric value). */
+export type MetricRow<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TMetricName extends string,
+> =
+  & { [K in DatasetDimensionNames<TDataset>]?: InferDimensionType<DatasetQueryableDimensions<TDataset>[K]> }
+  & { [K in TMetricName]?: string }
+  & { period?: string };
+
+/** A projection-aware typed result row for a metric query. */
+export type MetricRowFor<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TMetricName extends string,
+  TQuery = MetricQueryFor<TDataset, TMetricName>,
+> =
+  & { [K in SelectedDimensions<TDataset, TQuery>]?: InferDimensionType<DatasetQueryableDimensions<TDataset>[K]> }
+  & { [K in TMetricName]?: string }
+  & PeriodSelection<TQuery>;
+
+export interface MetricResultFor<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TMetricName extends string,
+  TQuery = MetricQueryFor<TDataset, TMetricName>,
+> {
+  data: MetricRowFor<TDataset, TMetricName, TQuery>[];
+  meta?: MetricResultMeta;
+}

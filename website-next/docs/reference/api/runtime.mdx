@@ -1,0 +1,236 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Serve Runtime
+description: Reference for serve({ queries }) and the exported api surface.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { CodeBlock } from 'fumadocs-ui/components/codeblock';
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+# Serve Runtime Reference
+
+Use `serve(config)` to turn query definitions into an exported runtime surface.
+
+<CodeBlock>
+```typescript
+export const api = serve({
+  queries: { activeUsers, weeklyRevenue },
+  basePath: '/api/analytics',
+});
+```
+</CodeBlock>
+
+## `serve(config)`
+
+`serve()` collects query definitions into one API object that can be executed locally, routed over HTTP, or mounted in frameworks.
+
+<TypeTable
+  type={{
+    queries: {
+      type: 'Record<string, QueryDefinition>',
+      description: 'Map of named query definitions created with `query({ ... })`.',
+    },
+    metrics: {
+      type: 'Record<string, MetricEntry>',
+      description: 'Named metrics. Each generates `POST /metrics/:name`. Entry is a metric ref or `{ metric, auth, requiredRoles, requiredScopes, cache, maxLimit, middlewares, tenant }`.',
+    },
+    datasets: {
+      type: 'Record<string, DatasetEntry>',
+      description: 'Semantic datasets. Each generates `POST /datasets/:name/query`. Entry is a dataset instance or `{ dataset, auth, requiredRoles, requiredScopes, cache, maxLimit, middlewares, tenant }`.',
+    },
+    queryBuilder: {
+      type: 'QueryBuilderFactoryLike',
+      description: 'Query builder used to execute metric/dataset endpoints. Required when `metrics` or `datasets` are provided (or supply it via `context`).',
+    },
+    semanticPaths: {
+      type: "{ metrics?: string; datasets?: string }",
+      description: "Override the path prefixes for semantic endpoints. Defaults to `{ metrics: '/metrics', datasets: '/datasets' }`.",
+    },
+    basePath: {
+      type: 'string',
+      description: 'Optional route prefix for docs, OpenAPI, and registered routes.',
+    },
+    context: {
+      type: 'object | factory',
+      description: 'Optional context factory on the unbound `serve()` export.',
+    },
+    auth: {
+      type: 'AuthStrategy | AuthStrategy[]',
+      description: 'Optional auth strategy configuration.',
+    },
+    tenant: {
+      type: 'TenantConfig',
+      description: 'Optional tenant isolation configuration.',
+    },
+    middlewares: {
+      type: 'ServeMiddleware[]',
+      description: 'Optional global middleware stack.',
+    },
+    docs: {
+      type: 'DocsOptions',
+      description: 'Built-in docs UI configuration.',
+    },
+    openapi: {
+      type: 'OpenApiOptions',
+      description: 'OpenAPI document configuration.',
+    },
+    cors: {
+      type: 'boolean | CorsConfig',
+      description: 'Optional CORS configuration.',
+    },
+    hooks: {
+      type: 'ServeLifecycleHooks',
+      description: 'Optional lifecycle callbacks.',
+    },
+    queryLogging: {
+      type: "boolean | 'json' | callback",
+      description: 'Optional query logging configuration.',
+    },
+    slowQueryThreshold: {
+      type: 'number',
+      description: 'Optional threshold for slow query warnings.',
+    },
+    security: {
+      type: '{ verboseAuthErrors?: boolean }',
+      description: 'Optional security options. `verboseAuthErrors` controls whether auth/authorization errors name the missing roles/scopes (default `false`).',
+    },
+  }}
+/>
+
+<Callout type="info">
+  Either `queries`, `metrics`, or `datasets` (or any combination) can be registered. Metric and dataset endpoints are generated automatically — you do not call `api.route(...)` for them — and appear in OpenAPI and `/docs`. See [Serve integration](/docs/datasets/serve-integration).
+</Callout>
+
+## Returned `api`
+
+The exported `api` object is the main runtime surface.
+
+It also exposes:
+
+- `queries`
+- `basePath`
+- `queryLogger`
+- `_routeConfig`
+
+`api.queries` includes auto-generated semantic endpoints: a metric is keyed by its name, and a dataset is keyed as `dataset:<name>`. Those same keys are used by `api.run(...)`, e.g. `api.run('revenue')` or `api.run('dataset:orders')`.
+
+### `api.route(path, endpoint, options?)`
+
+Registers an HTTP route for an existing query.
+
+<CodeBlock>
+```typescript
+api.route('/active-users', api.queries.activeUsers, {
+  method: 'POST',
+});
+```
+</CodeBlock>
+
+### `api.run(name, options?)`
+
+Runs a query in-process through the exported API.
+
+<CodeBlock>
+```typescript
+const rows = await api.run('activeUsers', {
+  input: { limit: 25 },
+});
+```
+</CodeBlock>
+
+Execution options support:
+
+- `input`
+- `context`
+- `request`
+
+### `api.execute(name, options?)`
+
+Alias for `api.run(...)`.
+
+### `api.client(name, options?)`
+
+Alias for in-process execution, useful when you want a client-like surface inside server code.
+
+### `api.handler`
+
+Framework-compatible request handler surface used by adapters such as `createFetchHandler`.
+
+<CodeBlock>
+```typescript
+import { createFetchHandler } from '@hypequery/serve';
+
+const handler = createFetchHandler(api.handler);
+```
+</CodeBlock>
+
+### `api.start(options?)`
+
+Starts a dedicated server directly from the exported API.
+
+<CodeBlock>
+```typescript
+const server = await api.start({ port: 4000 });
+```
+</CodeBlock>
+
+`start()` accepts options such as:
+
+- `port`
+- `hostname`
+- `signal`
+- `quiet`
+- `requestTimeout`
+- `bodyLimit`
+- `gracefulShutdownTimeout`
+
+### `api.use(middleware)`
+
+Pushes a global middleware onto the runtime.
+
+### `api.useAuth(strategy)`
+
+Appends an auth strategy to the runtime.
+
+### `api.describe()`
+
+Returns a runtime description object for docs/client tooling. `describe().queries` lists every endpoint, including semantic ones (keyed by metric name or `dataset:<name>`).
+
+### `api.manifest()`
+
+Returns a serializable `RouteManifest` mapping every query/metric/dataset key to its HTTP method and full path. Pass it to `@hypequery/react`'s `createHooks`/`createAnalyticsHooks` as `manifest` so the client can resolve routes without importing server code. This is required for metric/dataset endpoints, whose paths differ from their map keys.
+
+<CodeBlock>
+```typescript
+const manifest = api.manifest();
+// { revenue: { method: 'POST', path: '/metrics/revenue' },
+//   'dataset:orders': { method: 'POST', path: '/datasets/orders/query' }, ... }
+```
+</CodeBlock>
+
+## `api.queries`
+
+`api.queries` exposes the routed query definitions by name so they can be reused in `api.route(...)`.
+
+<CodeBlock>
+```typescript
+api.route('/weekly-revenue', api.queries.weeklyRevenue, {
+  method: 'POST',
+});
+```
+</CodeBlock>
+
+## Delivery Modes
+
+The same `api` can be used in three ways:
+
+- `api.run(...)` for in-process execution
+- `api.handler` for framework mounting
+- `api.start(...)` for a dedicated server
+
+## See Also
+
+- [Query Definition Reference](/docs/reference/api/query)
+- [Core Concepts](/docs/core-concepts)
+- [Type Helpers](/docs/reference/api/types)

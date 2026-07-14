@@ -1,0 +1,1339 @@
+import type { ZodType, ZodTypeAny } from "zod";
+import type { ServeQueryLogger, ServeQueryEventCallback } from "./query-logger.js";
+import type {
+  DatasetInstance,
+  DatasetQueryableDimensions,
+  DatasetQueryFor,
+  DatasetQueryResultFor,
+  KnownStringKeys,
+  MetricHandle,
+  MetricQueryFor,
+  MetricResultFor,
+  QueryBuilderFactoryInput,
+} from "@hypequery/datasets";
+
+/** Supported HTTP verbs for serve-managed endpoints. */
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
+
+export type HeaderMap = Record<string, string | undefined>;
+export type QueryParams = Record<string, string | string[] | undefined>;
+
+export interface ServeRequest<TBody = unknown> {
+  method: HttpMethod;
+  path: string;
+  query: QueryParams;
+  headers: HeaderMap;
+  body?: TBody;
+  /** Raw underlying request (IncomingMessage, Request, etc.) */
+  raw?: unknown;
+}
+
+export interface ServeResponse<TData = unknown> {
+  status: number;
+  headers?: Record<string, string>;
+  body: TData;
+}
+
+export type ServeHandler = (request: ServeRequest) => Promise<ServeResponse<unknown>>;
+
+export type ServeErrorType =
+  | "VALIDATION_ERROR"
+  | "UNAUTHORIZED"
+  | "FORBIDDEN"
+  | "QUERY_FAILURE"
+  | "CLICKHOUSE_UNREACHABLE"
+  | "RATE_LIMITED"
+  | "NOT_FOUND"
+  | "PAYLOAD_TOO_LARGE"
+  | "GATEWAY_TIMEOUT"
+  | "SERVICE_UNAVAILABLE"
+  | "INTERNAL_SERVER_ERROR";
+
+export interface ErrorEnvelope {
+  error: {
+    type: ServeErrorType;
+    message: string;
+    details?: Record<string, unknown>;
+  };
+}
+
+export interface ServeError extends Error {
+  status: number;
+  payload: ErrorEnvelope["error"];
+  cause?: unknown;
+}
+
+export type EndpointVisibility = "public" | "internal" | "private";
+
+export interface EndpointMetadata<TCustom = Record<string, unknown>> {
+  path: string;
+  method: HttpMethod;
+  name?: string;
+  summary?: string;
+  description?: string;
+  tags: string[];
+  deprecated?: boolean;
+  requiresAuth?: boolean;
+  /** Roles required to access this endpoint. Implies requiresAuth. */
+  requiredRoles?: string[];
+  /** Scopes required to access this endpoint. Implies requiresAuth. */
+  requiredScopes?: string[];
+  cacheTtlMs?: number | null;
+  visibility: EndpointVisibility;
+  /** Custom metadata fields for application-specific use cases */
+  custom?: TCustom;
+}
+
+export interface AuthContext {
+  userId?: string;
+  roles?: string[];
+  scopes?: string[];
+  tenantId?: string;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/**
+ * Type-safe auth context with constrained roles.
+ * Use this to enforce compile-time checking of role values.
+ *
+ * @example
+ * ```ts
+ * type AppRole = 'admin' | 'editor' | 'viewer';
+ * type AppAuth = AuthContextWithRoles<AppRole>;
+ *
+ * const api = defineServe<AppAuth>({
+ *   auth: jwtStrategy,
+ *   queries: {
+ *     adminOnly: query.requireRole('admin').query(async ({ ctx }) => {
+ *       // ✅ TypeScript autocomplete for 'admin' role
+ *       // ❌ Compile error if you use typo like 'admn'
+ *     }),
+ *   },
+ * });
+ * ```
+ */
+export type AuthContextWithRoles<TRoles extends string> = Omit<AuthContext, 'roles'> & {
+  roles?: TRoles[];
+};
+
+/**
+ * Type-safe auth context with constrained scopes.
+ * Use this to enforce compile-time checking of scope values.
+ *
+ * @example
+ * ```ts
+ * type AppScope = 'read:metrics' | 'write:metrics' | 'delete:metrics';
+ * type AppAuth = AuthContextWithScopes<AppScope>;
+ *
+ * const api = defineServe<AppAuth>({
+ *   auth: jwtStrategy,
+ *   queries: {
+ *     writeData: query.requireScope('write:metrics').query(async ({ ctx }) => {
+ *       // ✅ TypeScript autocomplete for scopes
+ *       // ❌ Compile error if you use typo like 'writ:metrics'
+ *     }),
+ *   },
+ * });
+ * ```
+ */
+export type AuthContextWithScopes<TScopes extends string> = Omit<AuthContext, 'scopes'> & {
+  scopes?: TScopes[];
+};
+
+/**
+ * Configuration for multi-tenant query isolation.
+ * Automatically enforces tenant-scoped data access.
+ */
+export interface TenantConfig<TAuth extends AuthContext = AuthContext> {
+  /**
+   * Function to extract the tenant ID from the auth context.
+   * @example
+   * extract: (auth) => auth.tenantId
+   * extract: (auth) => auth.organizationId
+   */
+  extract: (auth: TAuth) => string | null | undefined;
+
+  /**
+   * Whether tenant context is required.
+   * If true, requests without a valid tenant ID will be rejected.
+   * @default true
+   */
+  required?: boolean;
+
+  /**
+   * Column name for tenant filtering (e.g., 'organization_id', 'tenant_id').
+   * When specified with mode='auto-inject', provides tenant-scoped query helpers.
+   * @example
+   * column: 'organization_id'
+   */
+  column?: string;
+
+  /**
+   * Tenant isolation mode.
+   * - 'auto-inject': Provides tenant-scoped query helpers in context (recommended)
+   * - 'manual': Developer must manually filter queries (for complex cases)
+   * @default 'manual'
+   */
+  mode?: 'auto-inject' | 'manual';
+
+  /**
+   * Custom error message when tenant validation fails.
+   */
+  errorMessage?: string;
+}
+
+/**
+ * Per-endpoint tenant override. Merges with the global tenant config.
+ * Use this to flip required/optional or adjust mode without restating extract/column.
+ */
+export type TenantConfigOverride<TAuth extends AuthContext = AuthContext> = Partial<TenantConfig<TAuth>>;
+
+export interface AuthStrategyContext {
+  request: ServeRequest;
+  endpoint?: EndpointMetadata;
+}
+
+export type AuthStrategy<TAuth extends AuthContext = AuthContext> = (
+  context: AuthStrategyContext
+) => Promise<TAuth | null>;
+
+export type EndpointContext<
+  TInput = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = QueryRuntimeContext<TContext, TAuth> & {
+    input: TInput;
+    metadata: EndpointMetadata;
+    /** Extracted tenant ID if tenant config is enabled */
+    tenantId?: string;
+  };
+
+export type EndpointHandler<
+  TInput = unknown,
+  TResult = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = (ctx: EndpointContext<TInput, TContext, TAuth>) => Promise<TResult>;
+
+export type ServeMiddleware<
+  TInput = unknown,
+  TResult = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = (
+  ctx: EndpointContext<TInput, TContext, TAuth>,
+  next: () => Promise<TResult>
+) => Promise<TResult>;
+
+export type SchemaInput<T extends ZodTypeAny | undefined> = T extends ZodTypeAny
+  ? T["_input"]
+  : unknown;
+export type SchemaOutput<T extends ZodTypeAny | undefined> = T extends ZodTypeAny
+  ? T["_output"]
+  : unknown;
+
+type InferApiEntry<TEndpoint> = TEndpoint extends ServeEndpoint<
+  infer TInputSchema,
+  any,
+  any,
+  any,
+  infer TResult
+>
+  ? {
+      input: SchemaInput<TInputSchema>;
+      output: TResult;
+    } & InferSemanticMetadata<TEndpoint>
+  : never;
+
+/**
+ * Phantom compile-time markers attached to semantic endpoint types by
+ * `SemanticMetricEndpointMap` / `SemanticDatasetEndpointMap` so clients such
+ * as `@hypequery/react` can recover dataset/metric shapes structurally.
+ * Matching on the marker (rather than on the Zod input schema) is what keeps
+ * metric and dataset endpoints distinguishable: their query shapes are
+ * all-optional and mutually assignable. The property never exists at runtime.
+ */
+interface MetricEndpointSemantic<
+  TDataset extends DatasetInstance<any, any, any, any>,
+  TMetricName extends string,
+> {
+  readonly __hypequerySemantic?: {
+    kind: 'metric';
+    dimensions: DatasetQueryableDimensions<TDataset>;
+    measures: TDataset['measures'];
+    metricName: TMetricName;
+  };
+}
+
+interface DatasetEndpointSemantic<TDataset extends DatasetInstance<any, any, any, any>> {
+  readonly __hypequerySemantic?: {
+    kind: 'dataset';
+    dimensions: DatasetQueryableDimensions<TDataset>;
+    measures: TDataset['measures'];
+  };
+}
+
+type InferSemanticMetadata<TEndpoint> =
+  TEndpoint extends { readonly __hypequerySemantic?: infer TInfo }
+    ? NonNullable<TInfo> extends { kind: 'metric' } | { kind: 'dataset' }
+      ? { readonly __hypequerySemantic?: NonNullable<TInfo> }
+      : {}
+    : {};
+
+type ExtractServeQueries<
+  TTarget,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = TTarget extends ServeBuilder<infer TQueries, any, any>
+  ? TQueries
+  : TTarget extends ServeQueriesMap<TContext, TAuth>
+    ? TTarget
+    : never;
+
+type ServeQueryEntry<TTarget, TKey extends keyof ExtractServeQueries<TTarget, any, any>> =
+  ExtractServeQueries<TTarget, any, any>[TKey];
+
+export type InferExecutableQueryResult<TExecutable> = TExecutable extends QueryResolver<
+  any,
+  infer TResult,
+  any,
+  any
+>
+  ? Awaited<TResult>
+  : TExecutable extends { run: QueryResolver<any, infer TResult, any, any> }
+    ? Awaited<TResult>
+    : never;
+
+export type InferQueryInput<
+  TTarget,
+  TKey extends keyof ExtractServeQueries<TTarget, any, any>
+> = SchemaInput<ServeQueryEntry<TTarget, TKey>["inputSchema"]>;
+
+export type InferQueryOutput<
+  TTarget,
+  TKey extends keyof ExtractServeQueries<TTarget, any, any>
+> = SchemaOutput<ServeQueryEntry<TTarget, TKey>["outputSchema"]>;
+
+export type InferQueryResult<
+  TTarget,
+  TKey extends keyof ExtractServeQueries<TTarget, any, any>
+> = InferExecutableQueryResult<ServeQueryEntry<TTarget, TKey>["query"]>;
+
+/**
+ * Infer the API type from a ServeBuilder for use with @hypequery/react.
+ *
+ * @example
+ * const api = define({ queries: { hello: ... } });
+ * type Api = InferApiType<typeof api>;
+ * createHooks<Api>({ baseUrl: '/api' });
+ */
+export type InferApiType<TTarget> = TTarget extends ServeBuilder<infer TQueries, any, any>
+  ? {
+      [K in InferKnownStringKeys<TQueries>]: InferApiEntry<TQueries[K]>;
+    }
+  : TTarget extends HypeQueryAPI<infer TQueries, any, any>
+    ? {
+        [K in InferKnownStringKeys<TQueries>]: InferApiEntry<TQueries[K]>;
+      }
+  : never;
+
+export type QueryRuntimeContext<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = {
+  request: ServeRequest;
+  auth: TAuth | null;
+  locals: Record<string, unknown>;
+  setCacheTtl: (ttlMs: number | null) => void;
+} & TContext;
+
+export interface QueryResolverArgs<
+  TInput = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> {
+  input: TInput;
+  ctx: QueryRuntimeContext<TContext, TAuth>;
+}
+
+export type QueryResolver<
+  TInput = unknown,
+  TResult = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = (args: QueryResolverArgs<TInput, TContext, TAuth>) => Promise<TResult>;
+
+type QueryWrapper<TInput, TResult, TContext extends Record<string, unknown>, TAuth extends AuthContext> =
+  | QueryResolver<TInput, TResult, TContext, TAuth>
+  | {
+      run: QueryResolver<TInput, TResult, TContext, TAuth>;
+      describe?: () => string;
+    };
+
+export type ExecutableQuery<
+  TInput = unknown,
+  TResult = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = QueryWrapper<TInput, TResult, TContext, TAuth>;
+
+export interface DirectQueryExecuteOptions<
+  TInput = unknown,
+  TContext extends Record<string, unknown> = Record<string, unknown>
+> {
+  input?: TInput;
+  context?: Partial<TContext>;
+  request?: Partial<ServeRequest>;
+}
+
+export interface ServeEndpoint<
+  TInputSchema extends ZodTypeAny | undefined = undefined,
+  TOutputSchema extends ZodTypeAny = ZodTypeAny,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext,
+  TResult = SchemaOutput<TOutputSchema>
+> {
+  key: string;
+  method: HttpMethod;
+  inputSchema?: TInputSchema;
+  outputSchema: TOutputSchema;
+  handler: EndpointHandler<
+    SchemaInput<TInputSchema>,
+    TResult,
+    TContext,
+    TAuth
+  >;
+  query?: ExecutableQuery<SchemaInput<TInputSchema>, TResult, TContext, TAuth>;
+  middlewares: ServeMiddleware<
+    SchemaInput<TInputSchema>,
+    SchemaOutput<TOutputSchema>,
+    TContext,
+    TAuth
+  >[];
+  auth?: AuthStrategy<TAuth> | null;
+  tenant?: TenantConfigOverride<TAuth>;
+  metadata: EndpointMetadata;
+  cacheTtlMs?: number | null;
+  defaultHeaders?: Record<string, string>;
+  /** Roles required to access this endpoint. Checked after authentication. */
+  requiredRoles?: string[];
+  /** Scopes required to access this endpoint. Checked after authentication. */
+  requiredScopes?: string[];
+}
+
+
+export type ServeEndpointResult<
+  TEndpoint extends ServeEndpoint<any, any, any, any>
+> = TEndpoint extends ServeEndpoint<any, any, any, any, infer TResult> ? TResult : never;
+
+export interface ServeQueryConfig<
+  TInputSchema extends ZodTypeAny | undefined = undefined,
+  TOutputSchema extends ZodTypeAny = ZodTypeAny,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext,
+  TResult = SchemaOutput<TOutputSchema>
+> {
+  key?: string;
+  query: ExecutableQuery<SchemaInput<TInputSchema>, TResult, TContext, TAuth>;
+  method?: HttpMethod;
+  name?: string;
+  summary?: string;
+  description?: string;
+  tags?: string[];
+  inputSchema?: TInputSchema;
+  outputSchema?: TOutputSchema;
+  middlewares?: ServeMiddleware<
+    SchemaInput<TInputSchema>,
+    SchemaOutput<TOutputSchema>,
+    TContext,
+    TAuth
+  >[];
+  auth?: AuthStrategy<TAuth> | null;
+  /** Explicitly set whether authentication is required. Set by .requireAuth() or .public(). */
+  requiresAuth?: boolean;
+  tenant?: TenantConfigOverride<TAuth>;
+  cacheTtlMs?: number | null;
+  /** Roles required to access this endpoint. Checked after authentication. */
+  requiredRoles?: string[];
+  /** Scopes required to access this endpoint. Checked after authentication. */
+  requiredScopes?: string[];
+  /** Custom metadata for application-specific use cases */
+  custom?: Record<string, unknown>;
+}
+
+export interface StandaloneQueryDefinition<
+  TInputSchema extends ZodTypeAny | undefined = undefined,
+  TOutputSchema extends ZodTypeAny = ZodTypeAny,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext,
+  TResult = SchemaOutput<TOutputSchema>
+> extends ServeQueryConfig<TInputSchema, TOutputSchema, TContext, TAuth, TResult> {
+  run: QueryResolver<SchemaInput<TInputSchema>, TResult, TContext, TAuth>;
+  execute(options?: DirectQueryExecuteOptions<SchemaInput<TInputSchema>, TContext>): Promise<TResult>;
+}
+
+export interface QueryObjectConfig<
+  TInputSchema extends ZodTypeAny | undefined = undefined,
+  TOutputSchema extends ZodTypeAny | undefined = undefined,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext,
+  TResult = TOutputSchema extends ZodTypeAny ? SchemaOutput<TOutputSchema> : unknown
+> {
+  input?: TInputSchema;
+  output?: TOutputSchema;
+  method?: HttpMethod;
+  name?: string;
+  description?: string;
+  summary?: string;
+  tags?: string[];
+  auth?: AuthStrategy<TAuth> | null;
+  requiresAuth?: boolean;
+  tenant?: TenantConfigOverride<TAuth>;
+  cacheTtlMs?: number | null;
+  requiredRoles?: string[];
+  requiredScopes?: string[];
+  custom?: Record<string, unknown>;
+  query: QueryResolver<SchemaInput<TInputSchema>, TResult, TContext, TAuth>;
+}
+
+export type ServeQueriesMap<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> = Record<string, ServeQueryConfig<any, any, TContext, TAuth>>;
+
+export type ServeEndpointMap<
+  TQueries extends ServeQueriesMap<TContext, TAuth>,
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext
+> = {
+  [TKey in keyof TQueries]: TQueries[TKey] extends ServeQueryConfig<
+    infer TInputSchema,
+    infer TOutputSchema,
+    TContext,
+    TAuth,
+    infer TResult
+  >
+    ? ServeEndpoint<TInputSchema, TOutputSchema, TContext, TAuth, TResult>
+    : ServeEndpoint<any, any, TContext, TAuth>;
+};
+
+export interface DocsOptions {
+  enabled?: boolean;
+  path?: string;
+  title?: string;
+  subtitle?: string;
+  darkMode?: boolean;
+}
+
+export interface OpenApiOptions {
+  enabled?: boolean;
+  path?: string;
+  version?: string;
+  info?: {
+    title: string;
+    description?: string;
+    termsOfService?: string;
+    contact?: {
+      name?: string;
+      url?: string;
+      email?: string;
+    };
+    license?: {
+      name: string;
+      url?: string;
+    };
+  };
+  servers?: Array<{
+    url: string;
+    description?: string;
+  }>;
+}
+
+export interface OpenApiDocument {
+  openapi: string;
+  info: {
+    title: string;
+    version: string;
+    description?: string;
+    termsOfService?: string;
+    contact?: {
+      name?: string;
+      url?: string;
+      email?: string;
+    };
+    license?: {
+      name: string;
+      url?: string;
+    };
+  };
+  servers: Array<{
+    url: string;
+    description?: string;
+  }>;
+  paths: Record<string, Record<string, unknown>>;
+  components?: {
+    securitySchemes?: Record<string, unknown>;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Metric serve config types
+// ---------------------------------------------------------------------------
+
+/** Per-metric entry: shorthand (just the ref) or with overrides. */
+export type MetricEntry<TAuth extends AuthContext = AuthContext> =
+  | MetricHandle<any, any>
+  | {
+      metric: MetricHandle<any, any>;
+      auth?: AuthStrategy<TAuth> | null;
+      tenant?: TenantConfigOverride<TAuth>;
+      cache?: number | null;
+      requiredRoles?: string[];
+      requiredScopes?: string[];
+      /** Middleware applied to this metric endpoint. */
+      middlewares?: ServeMiddleware<any, any, any, TAuth>[];
+      /**
+       * Caps the page size for this metric. Requests above it are clamped (not
+       * rejected). Defaults to the dataset's `limits.maxResultSize`, else 1000.
+       */
+      maxLimit?: number;
+    };
+
+/** Map of metric names to entries. */
+export type MetricsConfig<TAuth extends AuthContext = AuthContext> =
+  Record<string, MetricEntry<TAuth>>;
+
+// ---------------------------------------------------------------------------
+// Dataset serve config types
+// ---------------------------------------------------------------------------
+
+import type { DatasetEntry } from "./semantic/datasets/dataset-endpoint.js";
+export type { DatasetEntry } from "./semantic/datasets/dataset-endpoint.js";
+
+/** Map of dataset names to entries. */
+export type DatasetsConfig<TAuth extends AuthContext = AuthContext> =
+  Record<string, DatasetEntry<TAuth>>;
+
+// ---------------------------------------------------------------------------
+// Extract the concrete dataset instance / metric name from a config entry so
+// the generated endpoint map carries field-level types. When an entry has been
+// widened (e.g. annotated as `AnyDatasetInstance` / `MetricHandle<any, any>`),
+// these resolve to the wide instance and the maps degrade gracefully to loose
+// `string` fields.
+// ---------------------------------------------------------------------------
+
+/** The dataset instance behind a `DatasetEntry` (bare instance or `{ dataset }`). */
+type DatasetInstanceOfEntry<TEntry> =
+  TEntry extends { __type: 'dataset' }
+    ? TEntry
+    : TEntry extends { dataset: infer TDataset }
+      ? (TDataset extends DatasetInstance<any, any, any, any> ? TDataset : never)
+      : never;
+
+/** The `MetricHandle` behind a `MetricEntry` (bare handle or `{ metric }`). */
+type MetricHandleOfEntry<TEntry> =
+  TEntry extends { __type: 'metric_ref' | 'grained_metric_ref' }
+    ? TEntry
+    : TEntry extends { metric: infer THandle }
+      ? THandle
+      : never;
+
+/** Unwrap a grained metric ref to its underlying base ref. */
+type BaseMetricRefOf<THandle> =
+  THandle extends { __type: 'grained_metric_ref'; metric: infer TRef }
+    ? TRef
+    : THandle;
+
+/** The concrete dataset instance a metric is defined on. */
+type MetricDatasetOfEntry<TEntry> =
+  BaseMetricRefOf<MetricHandleOfEntry<TEntry>> extends { dataset: infer TDataset }
+    ? (TDataset extends DatasetInstance<any, any, any, any> ? TDataset : never)
+    : never;
+
+/** The metric's output column name (used for typed rows and orderBy). */
+type MetricNameOfEntry<TEntry> =
+  BaseMetricRefOf<MetricHandleOfEntry<TEntry>> extends { name: infer TName }
+    ? (TName extends string ? TName : string)
+    : string;
+
+type InferKnownStringKeys<T> = [KnownStringKeys<T>] extends [never]
+  ? Extract<keyof T, string>
+  : KnownStringKeys<T>;
+
+export type SemanticMetricEndpointMap<
+  TMetrics extends MetricsConfig<TAuth>,
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext,
+> = {
+  [TKey in keyof TMetrics & string]: ServeEndpoint<
+    ZodType<MetricQueryFor<MetricDatasetOfEntry<TMetrics[TKey]>, MetricNameOfEntry<TMetrics[TKey]>>>,
+    ZodType<MetricResultFor<MetricDatasetOfEntry<TMetrics[TKey]>, MetricNameOfEntry<TMetrics[TKey]>>>,
+    TContext,
+    TAuth,
+    MetricResultFor<MetricDatasetOfEntry<TMetrics[TKey]>, MetricNameOfEntry<TMetrics[TKey]>>
+  > & MetricEndpointSemantic<MetricDatasetOfEntry<TMetrics[TKey]>, MetricNameOfEntry<TMetrics[TKey]>>;
+};
+
+export type SemanticDatasetEndpointMap<
+  TDatasets extends DatasetsConfig<TAuth>,
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext,
+> = {
+  [TKey in keyof TDatasets & string as `dataset:${TKey}`]: ServeEndpoint<
+    ZodType<DatasetQueryFor<DatasetInstanceOfEntry<TDatasets[TKey]>>>,
+    ZodType<DatasetQueryResultFor<DatasetInstanceOfEntry<TDatasets[TKey]>>>,
+    TContext,
+    TAuth,
+    DatasetQueryResultFor<DatasetInstanceOfEntry<TDatasets[TKey]>>
+  > & DatasetEndpointSemantic<DatasetInstanceOfEntry<TDatasets[TKey]>>;
+};
+
+export type ServeSemanticEndpointMap<
+  TMetrics extends MetricsConfig<TAuth>,
+  TDatasets extends DatasetsConfig<TAuth>,
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext,
+> = SemanticMetricEndpointMap<TMetrics, TContext, TAuth>
+  & SemanticDatasetEndpointMap<TDatasets, TContext, TAuth>;
+
+// ---------------------------------------------------------------------------
+// ServeConfig
+// ---------------------------------------------------------------------------
+
+export interface ServeConfig<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext,
+  TQueries extends ServeQueriesMap<TContext, TAuth> = Record<never, never>,
+  TMetrics extends MetricsConfig<TAuth> = Record<never, never>,
+  TDatasets extends DatasetsConfig<TAuth> = Record<never, never>
+> {
+  queries?: TQueries;
+  /**
+   * Metrics: auto-generated POST endpoints for each metric.
+   * Each metric gets a `POST /api/analytics/metrics/:name` endpoint
+   * that validates dimensions/filters against the metric's contract.
+   *
+   * @example
+   * ```ts
+   * const api = createAPI({
+   *   metrics: {
+   *     totalRevenue,           // shorthand
+   *     profitMargin: {         // with overrides
+   *       metric: profitMargin,
+   *       auth: requireRole('finance'),
+   *       cache: 300_000,
+   *     },
+   *   },
+   * });
+   * ```
+   */
+  metrics?: TMetrics;
+  /**
+   * Semantic dataset endpoints — auto-generated POST endpoints for each dataset.
+   * Each dataset gets a `POST /api/analytics/datasets/:name/query` endpoint
+   * that validates dimensions/measures/filters against the dataset definition.
+   *
+   * When Serve tenant isolation is enabled for semantic endpoints, set
+   * `tenant.column` in the Serve config or per-entry override so the runtime
+   * knows which column to enforce.
+   *
+   * Accepts an inline map of dataset instances.
+   *
+   * @example
+   * ```ts
+   * const api = createAPI({
+   *   datasets: { orders, customers },
+   *   queryBuilder: qb,
+   * });
+   * ```
+   */
+  datasets?: TDatasets;
+  /**
+   * Query builder instance for metric/dataset execution.
+   * Required when `metrics` or `datasets` are provided.
+   * Pass the return value of `createQueryBuilder(config)` directly.
+   *
+   * @example
+   * ```ts
+   * const qb = createQueryBuilder<Schema>(config);
+   * const api = createAPI({
+   *   metrics: { totalRevenue },
+   *   queryBuilder: qb,
+   * });
+   * ```
+   */
+  queryBuilder?: QueryBuilderFactoryInput;
+  basePath?: string;
+  middlewares?: ServeMiddleware<any, any, TContext, TAuth>[];
+  auth?: AuthStrategy<TAuth> | AuthStrategy<TAuth>[];
+  /** Global tenant configuration applied to all queries (can be overridden per-query) */
+  tenant?: TenantConfig<TAuth>;
+  /**
+   * CORS configuration. Pass `true` for permissive defaults (allow all origins),
+   * `false` / omit to disable, or an object for fine-grained control.
+   */
+  cors?: boolean | CorsConfig;
+  docs?: DocsOptions;
+  openapi?: OpenApiOptions;
+  context?: ServeContextFactory<TContext, TAuth>;
+  hooks?: ServeLifecycleHooks<TAuth>;
+  /**
+   * Enable query logging in production.
+   * - `true` — logs to console in human-readable text format
+   * - `'json'` — logs to console in structured JSON (for Datadog, CloudWatch, etc.)
+   * - `(event) => void` — custom callback
+   * - `false` / omitted — disabled (zero overhead)
+   *
+   * In development (`serveDev`), logging is always enabled regardless of this setting.
+   */
+  queryLogging?: boolean | 'json' | ServeQueryEventCallback;
+  /**
+   * Warn when a query takes longer than this many milliseconds.
+   * Emits a console.warn with the endpoint key and duration.
+   * Only applies when `queryLogging` is enabled.
+   */
+  slowQueryThreshold?: number;
+  /**
+   * Control verbosity of authentication/authorization error messages.
+   *
+   * - `true` — Detailed error messages that specify missing roles/scopes.
+   *   Better developer experience during debugging, but leaks your authorization structure.
+   *
+   * - `false` (default) — Generic error messages ("Access denied", "Insufficient permissions").
+   *   Recommended for all environments to prevent information leakage.
+   *
+   * @default false
+   *
+   * @example
+   * // Enable verbose errors for development
+   * const api = defineServe({
+   *   queries,
+   *   security: {
+   *     verboseAuthErrors: true
+   *   }
+   * });
+   */
+  security?: {
+    verboseAuthErrors?: boolean;
+  };
+  /**
+   * Customize path prefixes for auto-generated semantic layer endpoints.
+   * Useful for avoiding route collisions or organizing API structure.
+   *
+   * @default { metrics: '/metrics', datasets: '/datasets' }
+   *
+   * @example
+   * ```ts
+   * const api = createAPI({
+   *   metrics: { totalRevenue },
+   *   datasets: { orders: Orders },
+   *   semanticPaths: {
+   *     metrics: '/api/metrics',
+   *     datasets: '/api/data',
+   *   },
+   * });
+   * // Generates:
+   * // POST /api/metrics/totalRevenue
+   * // POST /api/data/orders/query
+   * ```
+   */
+  semanticPaths?: {
+    metrics?: string;
+    datasets?: string;
+    /** Path for the GET semantic-contract endpoint. Defaults to `/contract`. */
+    contract?: string;
+  };
+}
+
+export interface RouteRegistrationOptions<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> {
+  method?: HttpMethod;
+  name?: string;
+  summary?: string;
+  description?: string;
+  tags?: string[];
+  middlewares?: ServeMiddleware<any, any, TContext, TAuth>[];
+  requiresAuth?: boolean;
+  visibility?: EndpointVisibility;
+}
+
+/**
+ * CORS (Cross-Origin Resource Sharing) configuration.
+ * Controls which origins, methods, and headers are permitted for cross-origin requests.
+ *
+ * Pass `true` for permissive defaults (allow all origins), or an object for fine-grained control.
+ */
+export interface CorsConfig {
+  /**
+   * Allowed origin(s).
+   * - `"*"` allows any origin (not recommended with credentials).
+   * - A string matches that exact origin.
+   * - An array matches any origin in the list.
+   * - A function receives the request origin and returns true/false.
+   * @default "*"
+   */
+  origin?: string | string[] | ((origin: string) => boolean);
+  /**
+   * HTTP methods allowed for cross-origin requests.
+   * @default ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+   */
+  methods?: string[];
+  /**
+   * Headers the client is allowed to send.
+   * @default ["Content-Type","Authorization","X-Request-ID"]
+   */
+  allowedHeaders?: string[];
+  /**
+   * Headers the client is allowed to read from the response.
+   */
+  exposedHeaders?: string[];
+  /**
+   * Whether to include `Access-Control-Allow-Credentials: true`.
+   * @default false
+   */
+  credentials?: boolean;
+  /**
+   * How long (in seconds) browsers should cache the preflight response.
+   * @default 86400 (24 hours)
+   */
+  maxAge?: number;
+}
+
+/**
+ * Node-level handler mounted ahead of the serve router.
+ * Return `true` when the request was fully handled (response sent),
+ * `false` to fall through to the serve handler.
+ * Node adapter only — ignored by fetch/edge adapters.
+ */
+export type NodeMountHandler = (
+  req: import("http").IncomingMessage,
+  res: import("http").ServerResponse
+) => Promise<boolean> | boolean;
+
+export interface StartServerOptions {
+  port?: number;
+  hostname?: string;
+  signal?: AbortSignal;
+  /** Whether to suppress internal logging. */
+  quiet?: boolean;
+  /**
+   * Optional handler tried before the serve router — used by dev tooling
+   * such as `@hypequery/playground` to mount UI/API routes under `/__dev`.
+   * Node adapter only.
+   */
+  mount?: NodeMountHandler;
+  /**
+   * Maximum time in milliseconds a request handler is allowed to run
+   * before the server responds with 504 Gateway Timeout.
+   * Set to `0` to disable.
+   * @default 30000 (30 seconds)
+   */
+  requestTimeout?: number;
+  /**
+   * Maximum request body size in bytes.
+   * Requests exceeding this limit receive 413 Payload Too Large.
+   * Set to `0` to disable.
+   * @default 1048576 (1 MB)
+   */
+  bodyLimit?: number;
+  /**
+   * Maximum time in milliseconds to wait for in-flight requests
+   * to complete during graceful shutdown before force-closing.
+   * @default 10000 (10 seconds)
+   */
+  gracefulShutdownTimeout?: number;
+}
+
+/**
+ * Type-safe function signature for executing queries programmatically.
+ * Used internally by the serve builder for direct query execution.
+ */
+export type ExecuteQueryFunction<
+  TQueries extends Record<string, ServeEndpoint<any, any, any, any>>,
+  TContext extends Record<string, unknown>,
+> = <TKey extends keyof TQueries>(
+  key: TKey,
+  options?: {
+    input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+    context?: Partial<TContext>;
+    request?: Partial<ServeRequest>;
+  }
+) => Promise<ServeEndpointResult<TQueries[TKey]>>;
+
+/**
+ * A transport-agnostic API definition. Contains queries, auth, tenancy,
+ * and a handler — but no HTTP server. Pass to standalone transport functions:
+ *
+ * @example
+ * ```ts
+ * const api = createAPI({ queries: { ... }, auth: jwtStrategy });
+ *
+ * // Use with any transport:
+ * startServer(api, { port: 3000 });
+ * app.use('/analytics', toNodeHandler(api));
+ * export default toFetchHandler(api);
+ * ```
+ */
+/** A single route in a {@link RouteManifest}. */
+export interface RouteManifestEntry {
+  method: HttpMethod;
+  /** Full request path including the API base path. */
+  path: string;
+}
+
+/**
+ * Serializable map of query/metric/dataset keys to their HTTP method and full
+ * path. Keys match {@link HypeQueryAPI.queries} (including `dataset:<name>`
+ * keys for datasets), so it can be paired with `InferAPIType` and handed to
+ * `@hypequery/react`'s `createHooks({ manifest })` to resolve client routes
+ * without importing server code into the browser bundle.
+ */
+export type RouteManifest = Record<string, RouteManifestEntry>;
+
+export interface HypeQueryAPI<
+  TQueries extends Record<string, ServeEndpoint<any, any, any, any>> = Record<
+    string,
+    ServeEndpoint<any, any, any, any>
+  >,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> {
+  readonly queries: TQueries;
+  /** Serve-layer query logger for subscribing to endpoint execution events */
+  readonly queryLogger: ServeQueryLogger;
+  /** The underlying request handler. Can be passed directly to transport adapters. */
+  readonly handler: ServeHandler;
+  /**
+   * Build a serializable {@link RouteManifest} of every query/metric/dataset
+   * route (method + full path). Safe to JSON-serialize and ship to the client.
+   */
+  manifest(): RouteManifest;
+  route<Path extends string, TKey extends keyof TQueries>(
+    path: Path,
+    endpoint: TQueries[TKey],
+    options?: Partial<RouteRegistrationOptions<TContext, TAuth>>
+  ): this;
+  use(middleware: ServeMiddleware<any, any, TContext, TAuth>): this;
+  useAuth(strategy: AuthStrategy<TAuth>): this;
+  execute<TKey extends keyof TQueries>(
+    key: TKey,
+    options?: {
+      input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+      context?: Partial<TContext>;
+      request?: Partial<ServeRequest>;
+    }
+  ): Promise<ServeEndpointResult<TQueries[TKey]>>;
+  /** Alias of execute() for in-process execution. */
+  client<TKey extends keyof TQueries>(
+    key: TKey,
+    options?: {
+      input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+      context?: Partial<TContext>;
+      request?: Partial<ServeRequest>;
+    }
+  ): Promise<ServeEndpointResult<TQueries[TKey]>>;
+  /** Alias of execute() for in-process execution. */
+  run<TKey extends keyof TQueries>(
+    key: TKey,
+    options?: {
+      input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+      context?: Partial<TContext>;
+      request?: Partial<ServeRequest>;
+    }
+  ): Promise<ServeEndpointResult<TQueries[TKey]>>;
+  describe(): ToolkitDescription;
+}
+
+/**
+ * Infer the API type from a HypeQueryAPI for use with @hypequery/react.
+ *
+ * @example
+ * ```ts
+ * const api = createAPI({ queries: { hello: ... } });
+ * type Api = InferAPIType<typeof api>;
+ * createHooks<Api>({ baseUrl: '/api' });
+ * ```
+ */
+export type InferAPIType<TTarget> = TTarget extends HypeQueryAPI<infer TQueries, any, any>
+  ? {
+      [K in InferKnownStringKeys<TQueries>]: InferApiEntry<TQueries[K]>;
+    }
+  : TTarget extends ServeBuilder<infer TQueries, any, any>
+    ? {
+        [K in InferKnownStringKeys<TQueries>]: InferApiEntry<TQueries[K]>;
+      }
+  : never;
+
+/**
+ * @deprecated Use `HypeQueryAPI` and `createAPI()` instead. `ServeBuilder` adds
+ * transport concerns (`start()`) that should be handled separately.
+ */
+export interface ServeBuilder<
+  TQueries extends Record<string, ServeEndpoint<any, any, any, any>> = Record<
+    string,
+    ServeEndpoint<any, any, any, any>
+  >,
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> {
+  readonly queries: TQueries;
+  /** Base path applied to all registered routes, docs, and OpenAPI endpoints */
+  readonly basePath?: string;
+  /** Serve-layer query logger for subscribing to endpoint execution events */
+  readonly queryLogger: ServeQueryLogger;
+  /** Internal route configuration mapping query names to their HTTP methods */
+  readonly _routeConfig?: Record<string, { method: HttpMethod }>;
+  /**
+   * Build a serializable {@link RouteManifest} of every query/metric/dataset
+   * route (method + full path). Safe to JSON-serialize and ship to the client.
+   */
+  manifest(): RouteManifest;
+  route<Path extends string, TKey extends keyof TQueries>(
+    path: Path,
+    endpoint: TQueries[TKey],
+    options?: Partial<RouteRegistrationOptions<TContext, TAuth>>
+  ): this;
+  use(middleware: ServeMiddleware<any, any, TContext, TAuth>): this;
+  useAuth(strategy: AuthStrategy<TAuth>): this;
+  execute<TKey extends keyof TQueries>(
+    key: TKey,
+    options?: {
+      input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+      context?: Partial<TContext>;
+      request?: Partial<ServeRequest>;
+    }
+  ): Promise<ServeEndpointResult<TQueries[TKey]>>;
+  /** Alias of run() for in-process execution. */
+  client<TKey extends keyof TQueries>(
+    key: TKey,
+    options?: {
+      input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+      context?: Partial<TContext>;
+      request?: Partial<ServeRequest>;
+    }
+  ): Promise<ServeEndpointResult<TQueries[TKey]>>;
+  run<TKey extends keyof TQueries>(
+    key: TKey,
+    options?: {
+      input?: SchemaInput<TQueries[TKey]["inputSchema"]>;
+      context?: Partial<TContext>;
+      request?: Partial<ServeRequest>;
+    }
+  ): Promise<ServeEndpointResult<TQueries[TKey]>>;
+  describe(): ToolkitDescription;
+  handler: ServeHandler;
+  start(options?: StartServerOptions): Promise<ServeStartResult>;
+}
+
+export interface ServeInitializer<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+  TAuth extends AuthContext = AuthContext
+> {
+  readonly procedure: QueryProcedureBuilder<TContext, TAuth>;
+  readonly query: QueryFactory<TContext, TAuth>;
+  queries<TQueries extends ServeQueriesMap<TContext, TAuth>>(queries: TQueries): TQueries;
+  serve<
+    TQueries extends ServeQueriesMap<TContext, TAuth>,
+    TMetrics extends MetricsConfig<TAuth> = Record<never, never>,
+    TDatasets extends DatasetsConfig<TAuth> = Record<never, never>
+  >(
+    config: Omit<ServeConfig<TContext, TAuth, TQueries, TMetrics, TDatasets>, "context">
+  ): ServeBuilder<
+    ServeEndpointMap<TQueries, TContext, TAuth>
+      & ServeSemanticEndpointMap<TMetrics, TDatasets, TContext, TAuth>,
+    TContext,
+    TAuth
+  >;
+  define<
+    TQueries extends ServeQueriesMap<TContext, TAuth>,
+    TMetrics extends MetricsConfig<TAuth> = Record<never, never>,
+    TDatasets extends DatasetsConfig<TAuth> = Record<never, never>
+  >(
+    config: Omit<ServeConfig<TContext, TAuth, TQueries, TMetrics, TDatasets>, "context">
+  ): ServeBuilder<
+    ServeEndpointMap<TQueries, TContext, TAuth>
+      & ServeSemanticEndpointMap<TMetrics, TDatasets, TContext, TAuth>,
+    TContext,
+    TAuth
+  >;
+}
+
+export type QueryFactory<
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext,
+> = QueryProcedureBuilder<TContext, TAuth> & {
+  <
+    TInputSchema extends ZodTypeAny | undefined = undefined,
+    TOutputSchema extends ZodTypeAny | undefined = undefined,
+    TResult = TOutputSchema extends ZodTypeAny ? SchemaOutput<TOutputSchema> : unknown
+  >(
+    config: QueryObjectConfig<TInputSchema, TOutputSchema, TContext, TAuth, TResult>
+  ): StandaloneQueryDefinition<
+    TInputSchema,
+    TOutputSchema extends ZodTypeAny ? TOutputSchema : ZodTypeAny,
+    TContext,
+    TAuth,
+    TResult
+  >;
+};
+
+export interface QueryProcedureBuilder<
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext,
+  TInputSchema extends ZodTypeAny | undefined = undefined,
+  TOutputSchema extends ZodTypeAny = ZodTypeAny
+> {
+  input<TNewInputSchema extends ZodTypeAny>(
+    schema: TNewInputSchema
+  ): QueryProcedureBuilder<TContext, TAuth, TNewInputSchema, TOutputSchema>;
+  output<TNewOutputSchema extends ZodTypeAny>(
+    schema: TNewOutputSchema
+  ): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TNewOutputSchema>;
+  describe(description: string): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  name(name: string): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  summary(summary: string): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  tag(tag: string): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  tags(tags: string[]): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  method(method: HttpMethod): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  cache(ttlMs: number | null): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  auth(strategy: AuthStrategy<TAuth> | null): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  /**
+   * Require authentication for this endpoint.
+   * Equivalent to setting requiresAuth: true, but more explicit in the builder chain.
+   */
+  requireAuth(): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  /**
+   * Require the authenticated user to have at least one of the specified roles.
+   * Implies requireAuth(). Returns 403 if the user lacks the required role.
+   * @example query.requireRole('admin', 'editor').query(...)
+   */
+  requireRole(...roles: string[]): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  /**
+   * Require the authenticated user to have all of the specified scopes.
+   * Implies requireAuth(). Returns 403 if the user lacks a required scope.
+   * @example query.requireScope('read:metrics', 'read:users').query(...)
+   */
+  requireScope(...scopes: string[]): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  /**
+   * Explicitly mark this endpoint as public (no auth required).
+   * Overrides global auth strategies for this endpoint.
+   */
+  public(): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  tenant(config: TenantConfigOverride<TAuth>): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  /** Shorthand to mark tenant context as optional for this query. */
+  tenantOptional(
+    config?: TenantConfigOverride<TAuth>
+  ): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  /** Alias for requireAuth() to avoid confusion with other guard APIs. */
+  require(): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  custom(custom: Record<string, unknown>): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  use(
+    ...middlewares: ServeMiddleware<SchemaInput<TInputSchema>, SchemaOutput<TOutputSchema>, TContext, TAuth>[]
+  ): QueryProcedureBuilder<TContext, TAuth, TInputSchema, TOutputSchema>;
+  query<TExecutable extends ExecutableQuery<SchemaInput<TInputSchema>, any, TContext, TAuth>>(
+    executable: TExecutable
+  ): ServeQueryConfig<
+    TInputSchema,
+    TOutputSchema,
+    TContext,
+    TAuth,
+    InferExecutableQueryResult<TExecutable>
+  >;
+}
+
+export interface RequestLifecycleBase<TAuth extends AuthContext = AuthContext> {
+  requestId: string;
+  queryKey: string;
+  metadata: EndpointMetadata;
+  request: ServeRequest;
+  auth: TAuth | null;
+}
+
+export type RequestStartEvent<TAuth extends AuthContext = AuthContext> =
+  RequestLifecycleBase<TAuth>;
+
+export interface RequestEndEvent<TAuth extends AuthContext = AuthContext>
+  extends RequestLifecycleBase<TAuth> {
+  durationMs: number;
+  result: unknown;
+}
+
+export interface RequestErrorEvent<TAuth extends AuthContext = AuthContext>
+  extends RequestLifecycleBase<TAuth> {
+  durationMs: number;
+  error: unknown;
+}
+
+export interface AuthFailureEvent<TAuth extends AuthContext = AuthContext>
+  extends RequestLifecycleBase<TAuth> {
+  reason: "MISSING" | "INVALID";
+  error?: AuthErrorInfo;
+}
+
+export interface AuthErrorInfo {
+  reason: "MISSING" | "INVALID";
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface AuthorizationFailureEvent<TAuth extends AuthContext = AuthContext>
+  extends RequestLifecycleBase<TAuth> {
+  reason: "MISSING_ROLE" | "MISSING_SCOPE";
+  required: string[];
+  actual: string[];
+}
+
+export interface ServeLifecycleHooks<TAuth extends AuthContext = AuthContext> {
+  onRequestStart?: (event: RequestStartEvent<TAuth>) => MaybePromise<void>;
+  onRequestEnd?: (event: RequestEndEvent<TAuth>) => MaybePromise<void>;
+  onError?: (event: RequestErrorEvent<TAuth>) => MaybePromise<void>;
+  onAuthFailure?: (event: AuthFailureEvent<TAuth>) => MaybePromise<void>;
+  onAuthorizationFailure?: (event: AuthorizationFailureEvent<TAuth>) => MaybePromise<void>;
+}
+
+export interface ToolkitDescription {
+  basePath?: string;
+  queries: Array<ToolkitQueryDescription>;
+}
+
+export interface ToolkitQueryDescription {
+  key: string;
+  path: string;
+  method: HttpMethod;
+  name?: string;
+  summary?: string;
+  description?: string;
+  tags: string[];
+  visibility: EndpointVisibility;
+  requiresAuth: boolean;
+  requiresTenant?: boolean;
+  requiredRoles?: string[];
+  requiredScopes?: string[];
+  inputSchema?: unknown;
+  outputSchema?: unknown;
+  custom?: Record<string, unknown>;
+}
+
+export interface EndpointRegistry {
+  list(): ServeEndpoint<any, any, any, any>[];
+  register(endpoint: ServeEndpoint<any, any, any, any>): void;
+  match(method: HttpMethod, path: string): ServeEndpoint<any, any, any, any> | null;
+}
+
+export interface ServeStartResult {
+  stop(): Promise<void>;
+}
+
+export type FetchHandler = (request: Request) => Promise<Response>;
+
+export type MaybePromise<T> = Promise<T> | T;
+
+export type ServeContextFactory<
+  TContext extends Record<string, unknown>,
+  TAuth extends AuthContext
+> =
+  | TContext
+  | ((options: { request: ServeRequest; auth: TAuth | null }) => MaybePromise<TContext>);

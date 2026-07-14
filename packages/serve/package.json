@@ -1,0 +1,66 @@
+{
+  "name": "@hypequery/serve",
+  "version": "0.9.1",
+  "description": "Declarative HTTP server for exposing hypequery analytics endpoints",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./dev": {
+      "types": "./dist/dev.d.ts",
+      "import": "./dist/dev.js",
+      "require": "./dist/dev.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --project tsconfig.json --watch",
+    "lint": "eslint --ext .ts \"src/**/*.ts\"",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:types": "tsc --project tsconfig.type-tests.json",
+    "test": "npm run test:types && vitest run",
+    "types": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "jose": "^5.9.6",
+    "openapi-typescript": "^7.13.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5",
+    "@hypequery/datasets": "^0.10.0"
+  },
+  "peerDependencies": {
+    "tsx": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "tsx": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@vitest/coverage-v8": "^3.2.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hypequery/hypequery.git"
+  },
+  "homepage": "https://hypequery.com",
+  "bugs": {
+    "url": "https://github.com/hypequery/hypequery/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

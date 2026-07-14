@@ -1,0 +1,238 @@
+// @ts-nocheck
+import {
+  initializeTestConnection,
+  setupTestDatabase,
+  TEST_DATA
+} from './setup';
+import { CrossFilter } from '../../../index';
+import { SKIP_INTEGRATION_TESTS, SETUP_TIMEOUT } from './test-config.js';
+
+describe('Integration Tests - Cross Filtering', () => {
+  // Only run these tests if not skipped
+  (SKIP_INTEGRATION_TESTS ? describe.skip : describe)('ClickHouse Integration', () => {
+    let db: Awaited<ReturnType<typeof initializeTestConnection>>;
+
+    beforeAll(async () => {
+      if (!SKIP_INTEGRATION_TESTS) {
+        try {
+          // Setup only - don't start/stop container (handled by shell script)
+          db = await initializeTestConnection();
+          await setupTestDatabase();
+        } catch (error) {
+          console.error('Failed to set up integration tests:', error);
+          throw error;
+        }
+      }
+    }, SETUP_TIMEOUT);
+
+    test('should apply simple cross filter', async () => {
+      // Create a cross filter for category = 'A'
+      const filter = new CrossFilter();
+      filter.add({
+        column: 'category',
+        operator: 'eq',
+        value: 'A'
+      });
+
+      // Apply the filter to a query
+      const result = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .execute();
+
+      // Verify results
+      const expectedCount = TEST_DATA.test_table.filter(item => item.category === 'A').length;
+      expect(result).toHaveLength(expectedCount);
+      expect(result.every(item => String(item.category) === 'A')).toBe(true);
+    });
+
+    test('should apply multiple conditions with AND', async () => {
+      // Create a cross filter for category = 'A' AND active = 1
+      const filter = new CrossFilter();
+      filter.add({
+        column: 'category',
+        operator: 'eq',
+        value: 'A'
+      });
+      filter.add({
+        column: 'is_active',
+        operator: 'eq',
+        value: 1
+      });
+
+      // Apply the filter to a query
+      const result = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .execute();
+
+      // Verify results
+      const expectedCount = TEST_DATA.test_table.filter(
+        item => item.category === 'A' && item.is_active === true
+      ).length;
+      expect(result).toHaveLength(expectedCount);
+      expect(result.every(item => String(item.category) === 'A' && Number(item.is_active) === 1)).toBe(true);
+    });
+
+    test('should apply range filters', async () => {
+      // Create a cross filter for price between 15 and 25
+      const filter = new CrossFilter();
+      filter.add({
+        column: 'price',
+        operator: 'gte',
+        value: 15
+      });
+      filter.add({
+        column: 'price',
+        operator: 'lte',
+        value: 25
+      });
+
+      // Apply the filter to a query
+      const result = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .execute();
+
+      // Verify results
+      const expectedCount = TEST_DATA.test_table.filter(
+        item => item.price >= 15 && item.price <= 25
+      ).length;
+      expect(result).toHaveLength(expectedCount);
+      expect(result.every(item =>
+        Number(item.price) >= 15 && Number(item.price) <= 25
+      )).toBe(true);
+    });
+
+    test('should apply filter groups with OR', async () => {
+      // Create a cross filter for (category = 'A' OR category = 'B')
+      const filter = new CrossFilter();
+      filter.addGroup([
+        {
+          column: 'category',
+          operator: 'eq',
+          value: 'A'
+        },
+        {
+          column: 'category',
+          operator: 'eq',
+          value: 'B'
+        }
+      ], 'OR');
+
+      // Apply the filter to a query
+      const result = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .execute();
+
+      console.log('SQL: ', await db.table('test_table')
+        .applyCrossFilters(filter)
+        .toSQL())
+
+      // Verify results
+      const expectedCount = TEST_DATA.test_table.filter(
+        item => item.category === 'A' || item.category === 'B'
+      ).length;
+      expect(result).toHaveLength(expectedCount);
+      expect(result.every(item =>
+        String(item.category) === 'A' || String(item.category) === 'B'
+      )).toBe(true);
+    });
+
+    test('should apply complex nested filters', async () => {
+      // Create a cross filter for:
+      // (category = 'A' OR category = 'B') AND (price > 15 OR active = 0)
+      const filter = new CrossFilter();
+
+      // First group: category = 'A' OR category = 'B'
+      filter.addGroup([
+        {
+          column: 'category',
+          operator: 'eq',
+          value: 'A'
+        },
+        {
+          column: 'category',
+          operator: 'eq',
+          value: 'B'
+        }
+      ], 'OR');
+
+      // Second group: price > 15 OR active = 0
+      filter.addGroup([
+        {
+          column: 'price',
+          operator: 'gt',
+          value: 15
+        },
+        {
+          column: 'is_active',
+          operator: 'eq',
+          value: 0
+        }
+      ], 'OR');
+
+      // Apply the filter to a query
+      const result = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .execute();
+
+      // Verify results
+      const expectedCount = TEST_DATA.test_table.filter(
+        item => (item.category === 'A' || item.category === 'B') &&
+          (item.price > 15 || !item.is_active)
+      ).length;
+      expect(result).toHaveLength(expectedCount);
+
+      // Verify each result matches our complex condition
+      expect(result.every(item =>
+        (String(item.category) === 'A' || String(item.category) === 'B') &&
+        (Number(item.price) > 15 || Number(item.is_active) === 0)
+      )).toBe(true);
+    });
+
+    test('should apply cross filter to multiple queries', async () => {
+      // Create a cross filter for active = 1
+      const filter = new CrossFilter();
+      filter.add({
+        column: 'is_active',
+        operator: 'eq',
+        value: 1
+      });
+
+      // Apply to first query - get all active records
+      const allActiveResult = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .execute();
+
+      // Apply to second query - count active records by category
+      const countByCategory = await db.table('test_table')
+        .applyCrossFilters(filter)
+        .select(['category'])
+        .count('id', 'count')
+        .groupBy('category')
+        .execute();
+
+      // Verify first query results
+      const expectedActiveCount = TEST_DATA.test_table.filter(
+        item => item.is_active
+      ).length;
+      expect(allActiveResult).toHaveLength(expectedActiveCount);
+      expect(allActiveResult.every(item => Number(item.is_active) === 1)).toBe(true);
+
+      // Verify second query results
+      const categories = [...new Set(TEST_DATA.test_table
+        .filter(item => item.is_active)
+        .map(item => item.category))];
+
+      expect(countByCategory).toHaveLength(categories.length);
+
+      // Check counts for each category
+      for (const category of categories) {
+        const expectedCount = TEST_DATA.test_table.filter(
+          item => item.category === category && item.is_active
+        ).length;
+
+        const categoryResult = countByCategory.find(item => String(item.category) === category);
+        expect(Number(categoryResult?.count)).toBe(expectedCount);
+      }
+    });
+  });
+}); 

@@ -1,0 +1,198 @@
+name: CI Build and Release
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:latest
+        ports:
+          - 8123:8123
+          - 9000:9000
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: hypequery_test
+          CLICKHOUSE_DB: test_db
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        options: >-
+          --health-cmd "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Clean existing build artifacts
+        run: |
+          rm -rf packages/clickhouse/dist
+          find packages -name '*.tsbuildinfo' -delete
+      - name: Run lint
+        run: pnpm lint
+      - name: Build all hypequery packages
+        run: pnpm turbo run build --filter='@hypequery/*'
+      - name: Verify bin.js file exists
+        run: |
+          if [ -f "packages/clickhouse/dist/cli/bin.js" ]; then
+            echo "✅ bin.js exists"
+            ls -la packages/clickhouse/dist/cli/bin.js
+            head -n 1 packages/clickhouse/dist/cli/bin.js
+          else
+            echo "❌ bin.js does not exist!"
+            ls -la packages/clickhouse/dist/cli/
+            exit 1
+          fi
+      - name: Run unit tests
+        run: pnpm test
+      - name: Run ClickHouse integration tests
+        run: pnpm --filter @hypequery/clickhouse test:integration
+        env:
+          CLICKHOUSE_TEST_HOST: http://localhost:8123
+          CLICKHOUSE_TEST_USER: default
+          CLICKHOUSE_TEST_PASSWORD: hypequery_test
+          CLICKHOUSE_TEST_DB: test_db
+          NODE_OPTIONS: "--experimental-vm-modules --experimental-global-webcrypto --no-warnings"
+      - name: Run Datasets integration tests
+        run: pnpm --filter @hypequery/datasets test:integration
+        env:
+          CLICKHOUSE_TEST_HOST: http://localhost:8123
+          CLICKHOUSE_TEST_USER: default
+          CLICKHOUSE_TEST_PASSWORD: hypequery_test
+          CLICKHOUSE_TEST_DB: test_db
+          NODE_OPTIONS: "--experimental-vm-modules --experimental-global-webcrypto --no-warnings"
+      - name: Run Serve semantic live integration tests
+        run: pnpm --filter @hypequery/serve test:integration
+        env:
+          CLICKHOUSE_TEST_HOST: http://localhost:8123
+          CLICKHOUSE_TEST_USER: default
+          CLICKHOUSE_TEST_PASSWORD: hypequery_test
+          CLICKHOUSE_TEST_DB: test_db
+          NODE_OPTIONS: "--experimental-vm-modules --experimental-global-webcrypto --no-warnings"
+      - name: Run smoke tests
+        run: pnpm smoke:examples
+  canary-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build all hypequery packages
+        run: pnpm turbo run build --filter='@hypequery/*'
+      - name: Publish canary packages
+        run: |
+          cat <<'EOF' > .changeset/canary-release.md
+          ---
+          "@hypequery/clickhouse": patch
+          "@hypequery/datasets": patch
+          "@hypequery/serve": patch
+          "@hypequery/cli": patch
+          "@hypequery/mcp": patch
+          "@hypequery/protocol": patch
+          "@hypequery/react": patch
+          "@hypequery/schema": patch
+          ---
+
+          Temporary canary snapshot release.
+          EOF
+
+          cleanup() {
+            git checkout -- \
+              pnpm-lock.yaml \
+              packages/clickhouse/package.json \
+              packages/clickhouse/CHANGELOG.md \
+              packages/datasets/package.json \
+              packages/serve/package.json \
+              packages/serve/CHANGELOG.md \
+              packages/cli/package.json \
+              packages/cli/CHANGELOG.md \
+              packages/mcp-server/package.json \
+              packages/mcp-server/CHANGELOG.md \
+              packages/protocol/package.json \
+              packages/protocol/CHANGELOG.md \
+              packages/react/package.json \
+              packages/react/CHANGELOG.md \
+              packages/schema/package.json \
+              packages/schema/CHANGELOG.md 2>/dev/null || true
+            git checkout -- \
+              examples/auth-playground/package.json \
+              examples/next-dashboard/package.json \
+              examples/next-starter/package.json \
+              examples/node-embedded/package.json \
+              examples/vite-starter/package.json 2>/dev/null || true
+            rm -f .changeset/canary-release.md
+          }
+
+          trap cleanup EXIT
+
+          pnpm changeset version --snapshot canary
+          pnpm changeset publish --tag canary
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build all hypequery packages
+        run: pnpm turbo run build --filter='@hypequery/*'
+      - name: Create release PR or publish packages
+        uses: changesets/action@v1
+        with:
+          version: pnpm release:version
+          publish: pnpm release:publish
+          commit: "chore: release"
+          title: "chore: release"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

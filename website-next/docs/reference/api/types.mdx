@@ -1,0 +1,177 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Type Helpers
+description: TypeScript helpers for the current hypequery query and serve APIs.
+---
+
+import { CodeBlock } from 'fumadocs-ui/components/codeblock';
+
+# Type Helpers
+
+These are the most useful type helpers in the current `initServe` / `query({ ... })` / `serve({ queries })` path.
+
+## `InferApiType`
+
+Use `InferApiType` to extract the client-safe API shape from an exported `api`.
+
+<CodeBlock>
+```typescript
+import { InferApiType } from '@hypequery/serve';
+import { api } from '@/analytics/queries';
+
+type Api = InferApiType<typeof api>;
+```
+</CodeBlock>
+
+The inferred type maps each query key to:
+
+<CodeBlock>
+```typescript
+type Api = {
+  activeUsers: {
+    input: { limit?: number };
+    output: Array<{
+      id: string;
+      email: string;
+      created_at: string;
+    }>;
+  };
+};
+```
+</CodeBlock>
+
+This is the type you typically pass into `@hypequery/react`.
+
+When the API registers `metrics` or `datasets`, the inferred type also includes those endpoints: a metric appears under its name, and a dataset under the `dataset:<name>` key. The same `Infer*` helpers below work with these keys.
+
+<CodeBlock>
+```typescript
+// Metric endpoint input/output.
+type RevenueInput = InferQueryInput<typeof api, 'revenue'>;
+
+// Dataset endpoint, keyed as `dataset:<name>`.
+type OrdersInput = InferQueryInput<typeof api, 'dataset:orders'>;
+```
+</CodeBlock>
+
+## `InferQueryInput`
+
+Extract the input type for one query key from an exported `api` or query map.
+
+<CodeBlock>
+```typescript
+import type { InferQueryInput } from '@hypequery/serve';
+import { api } from '@/analytics/queries';
+
+type ActiveUsersInput = InferQueryInput<typeof api, 'activeUsers'>;
+```
+</CodeBlock>
+
+## `InferQueryOutput`
+
+Extract the output type for one query key.
+
+<CodeBlock>
+```typescript
+import type { InferQueryOutput } from '@hypequery/serve';
+import { api } from '@/analytics/queries';
+
+type ActiveUsersOutput = InferQueryOutput<typeof api, 'activeUsers'>;
+```
+</CodeBlock>
+
+## `InferQueryResult`
+
+Extract the resolved return type of the query resolver.
+
+<CodeBlock>
+```typescript
+import type { InferQueryResult } from '@hypequery/serve';
+import { api } from '@/analytics/queries';
+
+type ActiveUsersResult = InferQueryResult<typeof api, 'activeUsers'>;
+```
+</CodeBlock>
+
+## Query Input / Output Inference
+
+When you define a query with Zod schemas, TypeScript infers both input and output automatically:
+
+<CodeBlock>
+```typescript
+const activeUsers = query({
+  input: z.object({
+    limit: z.number().min(1).max(100).default(10),
+  }),
+  output: z.array(z.object({
+    id: z.string(),
+    email: z.string(),
+  })),
+  query: async ({ ctx, input }) => {
+    return ctx.db.table('users').select(['id', 'email']).limit(input.limit).execute();
+  },
+});
+```
+</CodeBlock>
+
+Inside the resolver:
+
+- `input` is inferred from `input`
+- the return value is checked against `output`
+
+## Resolver Types
+
+The runtime also exports resolver/context helpers:
+
+<CodeBlock>
+```typescript
+import type { QueryResolverArgs, QueryRuntimeContext } from '@hypequery/serve';
+```
+</CodeBlock>
+
+- `QueryResolverArgs<TInput, TContext, TAuth>`
+- `QueryRuntimeContext<TContext, TAuth>`
+
+## Query Builder Types
+
+The builder itself remains fully typed from your generated schema:
+
+<CodeBlock>
+```typescript
+import { createQueryBuilder } from '@hypequery/clickhouse';
+import type { IntrospectedSchema } from './schema';
+
+const db = createQueryBuilder<IntrospectedSchema>({ client });
+```
+</CodeBlock>
+
+That gives you:
+
+- typed table names
+- typed column names
+- typed result shapes
+- typed operators
+
+## React Hook Types
+
+`InferApiType` works directly with `createHooks`:
+
+<CodeBlock>
+```typescript
+import { createHooks } from '@hypequery/react';
+import { InferApiType } from '@hypequery/serve';
+import { api } from '@/analytics/queries';
+
+type Api = InferApiType<typeof api>;
+
+export const { useQuery, useMutation } = createHooks<Api>({
+  baseUrl: '/api',
+});
+```
+</CodeBlock>
+
+## See Also
+
+- [Query Definition Reference](/docs/reference/api/query)
+- [Serve Runtime Reference](/docs/reference/api/runtime)
+- [React hooks](/docs/reference/api/react)

@@ -1,0 +1,47 @@
+{
+  "name": "@hypequery/react",
+  "version": "0.5.0",
+  "description": "React hooks for consuming hypequery APIs",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -b --force && node scripts/verify-dist.js",
+    "types": "tsc -b --noEmit",
+    "test:types": "tsc --project tsconfig.type-tests.json",
+    "test": "npm run test:types && vitest run",
+    "lint": "eslint --ext .ts,.tsx \"src/**/*.ts\" \"src/**/*.tsx\"",
+    "prepack": "pnpm build"
+  },
+  "peerDependencies": {
+    "@tanstack/react-query": "^5.0.0",
+    "react": "^18.0.0 || ^19.0.0",
+    "react-dom": "^18.0.0 || ^19.0.0"
+  },
+  "devDependencies": {
+    "@hypequery/datasets": "workspace:*",
+    "@hypequery/serve": "workspace:*",
+    "@tanstack/react-query": "^5.0.0",
+    "@testing-library/react": "^14.2.1",
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.18",
+    "@vitest/coverage-v8": "^3.2.6",
+    "jsdom": "^27.4.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.6"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

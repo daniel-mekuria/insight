@@ -1,0 +1,115 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Query Builder API
+description: Quick reference for the hypequery ClickHouse query builder API.
+---
+
+import { CodeBlock } from 'fumadocs-ui/components/codeblock';
+
+Use this page as a quick method index. For concepts and worked examples, use the main query-building guides.
+
+## Start Here
+
+- [Query Basics](/docs/query-building/basics)
+- [Select](/docs/query-building/select)
+- [Where](/docs/query-building/where)
+- [Joins](/docs/query-building/joins)
+- [Aggregation](/docs/query-building/aggregation)
+- [Ordering](/docs/query-building/ordering)
+- [Time Functions](/docs/query-building/time-functions)
+- [Subqueries & CTEs](/docs/query-building/subqueries-ctes)
+- [SQL Expressions](/docs/query-building/sql-expressions)
+- [Helper Methods](/docs/query-building/helper-methods)
+
+## Core Methods
+
+### `table()`
+
+<CodeBlock>
+```ts
+db.table('users')
+```
+</CodeBlock>
+
+Starts a query from a typed table.
+
+### `select()`
+
+<CodeBlock>
+```ts
+db.table('users').select(['id', 'name', 'email'])
+```
+</CodeBlock>
+
+Chooses output columns and updates the inferred result type.
+
+### `where()`
+
+<CodeBlock>
+```ts
+db.table('users').where('status', 'eq', 'active')
+```
+</CodeBlock>
+
+Adds predicates with typed operators and values. See [Where](/docs/query-building/where).
+
+### `execute()`
+
+<CodeBlock>
+```ts
+const rows = await db.table('users').select(['id']).execute();
+```
+</CodeBlock>
+
+Runs the query and returns typed results.
+
+### `stream()`
+
+<CodeBlock>
+```ts
+const stream = await db.table('events').stream();
+```
+</CodeBlock>
+
+Streams result batches for large datasets.
+
+### `streamForEach()`
+
+<CodeBlock>
+```ts
+await db.table('events').streamForEach(async (row) => {
+  await processEvent(row);
+});
+```
+</CodeBlock>
+
+Processes rows incrementally with a callback.
+
+## Join Methods
+
+- `innerJoin()`
+- `leftJoin()`
+- `rightJoin()`
+- `fullJoin()`
+
+See [Joins](/docs/query-building/joins) for patterns and examples.
+
+## Other Common Methods
+
+- `groupBy()`
+- `having()`
+- `orderBy()`
+- `limit()`
+- `offset()`
+- `distinct()`
+- `prewhere()`
+- `final()`
+- `whereNull()` / `whereNotNull()`
+- `settings()`
+- `raw()`
+- `rawQuery()`
+- `withCTE()`
+- `toSQL()`
+- `toSQLWithParams()`
+
+Use the dedicated guides above for examples and edge cases.

@@ -1,0 +1,19 @@
+{
+  "title": "Query builder",
+  "pages": [
+    "basics",
+    "select",
+    "where",
+    "joins",
+    "join-relationships",
+    "aggregation",
+    "ordering",
+    "caching",
+    "time-functions",
+    "helper-methods",
+    "sql-expressions",
+    "subqueries-ctes",
+    "advanced-filtering",
+    "inserts"
+  ]
+}

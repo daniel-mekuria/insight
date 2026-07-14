@@ -1,0 +1,204 @@
+---
+title: Query Basics
+description: Learn the hypequery ClickHouse query builder for TypeScript. Build type-safe queries with autocomplete, reusable filters, joins, and strongly typed results.
+
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { CodeBlock } from 'fumadocs-ui/components/codeblock';
+
+## Core Concepts
+
+The query builder is designed to be:
+- **Type-safe** - TypeScript ensures columns and types are correct
+- **Fluent** - Chain methods naturally to build complex queries
+- **ClickHouse-first** - Models ClickHouse query building directly instead of pretending every database behaves the same way
+
+## Start with a typed ClickHouse client
+
+Start by generating types from your ClickHouse schema if you have not done so already. See the [CLI reference](/docs/reference/api/cli) for `hypequery generate`.
+
+The core builder API starts with a typed `db` client. These docs show the raw builder chain first because it is the clearest way to learn:
+
+<CodeBlock>
+```typescript
+import { createClient } from '@clickhouse/client';
+import { createQueryBuilder } from '@hypequery/clickhouse';
+import type { Schema } from './generated-schema';
+
+const client = createClient({
+  url: process.env.CLICKHOUSE_URL!,
+  username: process.env.CLICKHOUSE_USER!,
+  password: process.env.CLICKHOUSE_PASSWORD!,
+  database: process.env.CLICKHOUSE_DATABASE!,
+});
+
+const db = createQueryBuilder<Schema>({ client });
+
+const activeUsers = await db
+  .table('users')
+  .where('status', 'eq', 'active')
+  .select(['id', 'name', 'email'])
+  .execute();
+```
+</CodeBlock>
+
+When you move into query definitions, the builder chain stays the same. The Query Building section keeps examples in terms of a standalone typed `db` client so the builder API is easier to learn in isolation.
+
+## Query Builder Pattern
+
+All queries follow this pattern:
+
+<CodeBlock>
+```typescript
+return db
+  .table('table_name')
+  .where('column', 'operator', 'value')
+  .select(['col1', 'col2'])
+  .orderBy('created_at', 'DESC')
+  .limit(10)
+  .execute();
+```
+</CodeBlock>
+
+<Callout type="tip" title="Remember">
+  Always finish your query chains with `.execute()` to run the query.
+</Callout>
+
+## Builder immutability
+
+Builder methods return a new builder state. In normal chained code that is easy to miss because the fluent style reads naturally, but it matters when you build queries conditionally.
+
+<CodeBlock>
+```typescript
+// Good: reassign as you add optional clauses
+let query = db.table('users');
+
+if (onlyActive) {
+  query = query.where('status', 'eq', 'active');
+}
+
+if (limit) {
+  query = query.limit(limit);
+}
+
+const rows = await query.select(['id', 'email']).execute();
+```
+</CodeBlock>
+
+<CodeBlock>
+```typescript
+// Fragile: these calls do not update query unless you keep the return value
+const query = db.table('users');
+
+if (onlyActive) {
+  query.where('status', 'eq', 'active');
+}
+
+if (limit) {
+  query.limit(limit);
+}
+```
+</CodeBlock>
+
+<Callout type="warning" title="Migration note">
+  If you have older code that conditionally calls builder methods without reassigning the returned builder, update it for `v2.0.0`.
+</Callout>
+
+## Query Building Blocks
+
+The query builder is organized into logical concepts. Each concept has detailed documentation:
+
+### Core Operations
+
+| Concept | Description | Link |
+| --- | --- | --- |
+| **Select** | Choose which columns to return, use aliases, and expressions | [Select →](/docs/query-building/select) |
+| **Where** | Filter rows using conditions, operators, and predicates | [Where →](/docs/query-building/where) |
+| **Joins** | Combine data from multiple tables | [Joins →](/docs/query-building/joins) |
+| **Aggregation** | Group data and calculate summaries (sum, count, avg) | [Aggregation →](/docs/query-building/aggregation) |
+| **Ordering** | Sort results and paginate with limit/offset | [Ordering →](/docs/query-building/ordering) |
+| **Subqueries & CTEs** | Compose subqueries, reusable CTEs, and more complex builder flows | [Subqueries & CTEs →](/docs/query-building/subqueries-ctes) |
+| **SQL Expressions** | Drop to raw SQL fragments and expression helpers when the fluent API is not enough | [SQL Expressions →](/docs/query-building/sql-expressions) |
+| **Time Functions** | Work with dates, timestamps, and time intervals | [Time Functions →](/docs/query-building/time-functions) |
+
+## Type Safety
+
+hypequery ensures type safety throughout the query building process:
+
+<CodeBlock>
+```typescript
+// TypeScript knows the exact columns in your schema
+db
+  .table('users')
+  .select(['id', 'name', 'email'])
+  .execute();
+// Returns: Promise<Array<{ id: number; name: string; email: string }>>
+
+// Invalid columns are caught at compile time
+db
+  .table('users')
+  .select(['id', 'invalid_column']) // ❌ TypeScript error
+  .execute();
+
+// Operators match column types
+db
+  .table('users')
+  .where('created_at', 'eq', '2024-01-01') // ✅ Valid
+  .where('age', 'gte', 18) // ✅ Valid
+  .execute();
+```
+</CodeBlock>
+
+## Execution Methods
+
+### execute()
+
+Run the query and get all results:
+
+<CodeBlock>
+```typescript
+const users = await db
+  .table('users')
+  .where('status', 'eq', 'active')
+  .select(['id', 'name'])
+  .execute();
+```
+</CodeBlock>
+
+### stream()
+
+Stream results for large datasets:
+
+<CodeBlock>
+```typescript
+const stream = await db
+  .table('events')
+  .select(['id', 'data'])
+  .stream();
+
+const reader = stream.getReader();
+while (true) {
+  const { done, value: rows } = await reader.read();
+  if (done) break;
+  // Process rows in batches
+}
+```
+</CodeBlock>
+
+### streamForEach()
+
+Process rows with a callback:
+
+<CodeBlock>
+
+```typescript
+await db
+  .table('events')
+  .select(['id', 'data'])
+  .streamForEach(async (row) => {
+    await processEvent(row);
+  });
+```
+
+</CodeBlock>
